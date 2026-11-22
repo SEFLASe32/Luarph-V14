@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
+  Archive,
   Binary,
   Check,
   Code2,
@@ -7,6 +8,7 @@ import {
   Cpu,
   Download,
   FileCode2,
+  FolderGit2,
   Play,
   RotateCcw,
   Search,
@@ -14,6 +16,15 @@ import {
 } from 'lucide-react';
 import decodedLuaRaw from '../decoded.lua?raw';
 import defaultInputLua from '../input.lua?raw';
+import conditionalsLoopsLua from '../examples/conditionals_loops.lua?raw';
+import tablesFibonacciLua from '../examples/tables_fibonacci.lua?raw';
+import encoderMjsRaw from '../encoder.mjs?raw';
+import testCompareMjsRaw from '../test-compare.mjs?raw';
+import readmeMdRaw from '../README.md?raw';
+import licenseRaw from '../LICENSE?raw';
+import gitignoreRaw from '../.gitignore?raw';
+import ciYmlRaw from '../.github/workflows/ci.yml?raw';
+import packageJsonRaw from '../package.json?raw';
 import {
   ANALYZED_OPCODES,
   FORMAT_CONSTANTS,
@@ -31,8 +42,9 @@ import {
   type OpcodeCategory,
   type VMChunk,
 } from './lib/vmEngine';
+import { buildZipBlob, triggerBlobDownload } from './lib/zipBuilder';
 
-type NavTab = 'overview' | 'opcodes' | 'decoded' | 'encoder';
+type NavTab = 'overview' | 'opcodes' | 'decoded' | 'encoder' | 'github';
 
 const OPCODE_CATEGORIES: ('All' | OpcodeCategory)[] = [
   'All',
@@ -43,6 +55,12 @@ const OPCODE_CATEGORIES: ('All' | OpcodeCategory)[] = [
   'Calls & Returns',
   'VM Introspection',
 ];
+
+const LUA_PRESETS = [
+  { id: 'basic', label: 'input.lua (Basic)', code: defaultInputLua },
+  { id: 'cond', label: 'conditionals_loops.lua', code: conditionalsLoopsLua },
+  { id: 'tables', label: 'tables_fibonacci.lua', code: tablesFibonacciLua },
+] as const;
 
 const OBFUSCATION_LAYERS = [
   {
@@ -61,7 +79,7 @@ const OBFUSCATION_LAYERS = [
     layer: '03',
     name: 'Numeric & Literal Obfuscation',
     detail:
-      'เข้ารหัสตัวเลขด้วยฐานสิบหก (0X...), ฐานสอง (0B...), ตัวคั่น underscore (0b100_00) และ escape sequence (\\z, \\u{...})',
+      'เข้ารหัสตัวเลขด้วยฐานสิบหก (0X...), ฐานสอง (0B...), ตัวคั่น underscore (0b100_00) และ escape sequence (\\ddd, \\xHH, \\z, \\u{...})',
   },
   {
     layer: '04',
@@ -98,14 +116,16 @@ const BINARY_SPEC_ROWS = [
   { field: 'Instruction Operands', value: 'val * 8 + mode', encoding: '4 Signed 53-bit varints (A, B, C, op); mode 1=reg, 2=const, 4=proto' },
 ];
 
+const GIT_PUSH_COMMANDS = `git init
+git add .
+git commit -m "feat: Lua VM static analysis, Luraph-style reverse encoder, and test suite"
+git branch -M main
+git remote add origin https://github.com/<YOUR_USERNAME>/lua-vm-reverse-encoder.git
+git push -u origin main`;
+
 function downloadTextFile(filename: string, content: string) {
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+  triggerBlobDownload(filename, blob);
 }
 
 function formatOperand(val: number, mode: number, resolved: unknown): string {
@@ -124,12 +144,16 @@ export default function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   // Reverse Encoder state
+  const [activePreset, setActivePreset] = useState<string>('basic');
   const [luaInput, setLuaInput] = useState(defaultInputLua);
   const [xorKeyHex, setXorKeyHex] = useState('5A');
   const [emitterStyle, setEmitterStyle] = useState<EmitterStyle>('luraph');
   const [luaDialect, setLuaDialect] = useState<LuaDialect>('luau');
   const [seed, setSeed] = useState<number>(0x143a7);
   const [outputMode, setOutputMode] = useState<'lua' | 'ascii85' | 'disasm'>('lua');
+
+  // GitHub Pack file preview state
+  const [selectedRepoFile, setSelectedRepoFile] = useState<string>('README.md');
 
   const copyText = (key: string, text: string) => {
     navigator.clipboard.writeText(text);
@@ -184,7 +208,6 @@ export default function App() {
       });
       const encodedLua = generated.code;
 
-      // Verify all generated CFF bit32 state transitions mathematically
       const cffVerified = generated.cffChecks.every((ch) => {
         const computed =
           ch.delta +
@@ -194,7 +217,6 @@ export default function App() {
         return computed === ch.nextState;
       });
 
-      // Extract LPH- back out of the generated Lua file just like test-compare.mjs
       const match = encodedLua.match(/"(LPH-(?:\\.|[^"\\])*)"/);
       if (!match) {
         throw new Error('Could not extract LPH- payload from generated Lua output');
@@ -203,7 +225,6 @@ export default function App() {
       const decodedBytes = decodeAscii85(extracted);
       const roundTripped: VMChunk = deserializeChunk(decodedBytes, parsedXorKey);
 
-      // Compare direct compiled execution (with plaintext round-trip) vs full encoded round-trip
       const directChunk = deserializeChunk(serializeChunk(compiled, 0), 0);
       const directResult = executeChunk(directChunk);
       const roundTripResult = executeChunk(roundTripped);
@@ -235,11 +256,47 @@ export default function App() {
     }
   }, [luaInput, parsedXorKey, emitterStyle, luaDialect, seed]);
 
+  // Complete GitHub repository bundle
+  const githubFiles = useMemo(() => {
+    const encodedOut = encoderRun.ok
+      ? encoderRun.encodedLua
+      : generateEncodedLua(encodeAscii85(serializeChunk(compileLuaToChunk(defaultInputLua), 0x5a)), 0x5a).code;
+
+    return [
+      { path: 'README.md', desc: 'คู่มือการใช้งาน โครงสร้างไฟล์ และคำสั่ง CLI (TH/EN)', content: readmeMdRaw },
+      { path: 'LICENSE', desc: 'MIT Open-Source License', content: licenseRaw },
+      { path: '.gitignore', desc: 'Git ignore rules สำหรับ Node.js / Vite', content: gitignoreRaw },
+      { path: '.github/workflows/ci.yml', desc: 'GitHub Actions CI (รัน test-compare, lint และ build)', content: ciYmlRaw },
+      { path: 'package.json', desc: 'npm scripts (encode, test:encoder, dev, build)', content: packageJsonRaw },
+      { path: 'decoded.lua', desc: 'โค้ดโครงสร้าง VM & Deserializer ที่แกะแบบอ่านง่าย', content: decodedLuaRaw },
+      { path: 'encoder.mjs', desc: 'Node.js Luraph-Style Reverse Encoder (104-op tree + CFF)', content: encoderMjsRaw },
+      { path: 'test-compare.mjs', desc: 'ชุดทดสอบ 4 กรณี (เทียบผลลัพธ์ + ตรวจสมการ CFF)', content: testCompareMjsRaw },
+      { path: 'input.lua', desc: 'สคริปต์ตัวอย่างหลัก (ฟังก์ชัน + numeric for)', content: defaultInputLua },
+      { path: 'output_encoded.lua', desc: 'ผลลัพธ์ไฟล์ที่เข้ารหัสแล้ว (Luraph-Style Single-Line)', content: encodedOut },
+      { path: 'examples/conditionals_loops.lua', desc: 'ตัวอย่าง if/elseif/else, while, repeat..until, unary/math', content: conditionalsLoopsLua },
+      { path: 'examples/tables_fibonacci.lua', desc: 'ตัวอย่าง table literals, array/field access, #length', content: tablesFibonacciLua },
+    ];
+  }, [encoderRun]);
+
+  const handleDownloadGithubZip = () => {
+    const zipBlob = buildZipBlob(
+      githubFiles.map((f) => ({
+        path: `lua-vm-reverse-encoder/${f.path}`,
+        content: f.content,
+      }))
+    );
+    triggerBlobDownload('lua-vm-reverse-encoder-github.zip', zipBlob);
+  };
+
+  const selectedRepoFileObj =
+    githubFiles.find((f) => f.path === selectedRepoFile) || githubFiles[0];
+
   const navItems: { id: NavTab; label: string; icon: typeof Binary; meta: string }[] = [
     { id: 'overview', label: 'Static Analysis', icon: Binary, meta: 'Luraph v14.3' },
     { id: 'opcodes', label: 'Opcode Map', icon: Cpu, meta: '104 ops' },
     { id: 'decoded', label: 'decoded.lua', icon: FileCode2, meta: `${decodedLines.length} lines` },
-    { id: 'encoder', label: 'Reverse Encoder', icon: Terminal, meta: 'Round-Trip' },
+    { id: 'encoder', label: 'Reverse Encoder', icon: Terminal, meta: '104-op VM' },
+    { id: 'github', label: 'GitHub Pack', icon: FolderGit2, meta: `${githubFiles.length} files` },
   ];
 
   return (
@@ -313,23 +370,22 @@ export default function App() {
               {activeTab === 'opcodes' && 'Reconstructed Register-VM Opcode Table (0..103)'}
               {activeTab === 'decoded' && 'decoded.lua — Reconstructed VM & Deserializer Logic'}
               {activeTab === 'encoder' && 'Reverse Encoder Simulator & Round-Trip Output Verifier'}
+              {activeTab === 'github' && 'GitHub Repository Export Pack & CI Configuration'}
             </h2>
           </div>
 
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => downloadTextFile('decoded.lua', decodedLuaRaw)}
+              onClick={handleDownloadGithubZip}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
             >
-              <Download className="w-3.5 h-3.5" />
-              decoded.lua
+              <Archive className="w-3.5 h-3.5" />
+              Download GitHub (.zip)
             </button>
             <button
               type="button"
-              onClick={() => {
-                setActiveTab('encoder');
-              }}
+              onClick={() => setActiveTab('encoder')}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 text-xs font-medium text-white hover:bg-blue-700 cursor-pointer"
             >
               <Play className="w-3.5 h-3.5" />
@@ -342,7 +398,6 @@ export default function App() {
           {/* TAB 1: OVERVIEW */}
           {activeTab === 'overview' && (
             <>
-              {/* Key Metrics Row */}
               <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className="bg-white border border-slate-200 rounded-lg p-4">
                   <div className="text-xs text-slate-500">Source File Size</div>
@@ -374,7 +429,6 @@ export default function App() {
                 </div>
               </section>
 
-              {/* Two-Stage Payload Map */}
               <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <h3 className="text-sm font-semibold text-slate-900">
@@ -424,7 +478,6 @@ export default function App() {
                 </div>
               </section>
 
-              {/* Obfuscation Layers */}
               <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                 <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-slate-900">
@@ -452,7 +505,6 @@ export default function App() {
                 </div>
               </section>
 
-              {/* Binary Format Table */}
               <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                 <div className="px-5 py-3.5 border-b border-slate-200">
                   <h3 className="text-sm font-semibold text-slate-900">
@@ -654,30 +706,35 @@ export default function App() {
           {/* TAB 4: REVERSE ENCODER & VERIFIER */}
           {activeTab === 'encoder' && (
             <div className="space-y-5">
-              {/* CLI Reference Strip */}
+              {/* Preset Selector & CLI Strip */}
               <section className="bg-white border border-slate-200 rounded-lg p-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="text-xs font-semibold text-slate-900">
-                    Node.js CLI Commands (Workspace Root)
-                  </div>
-                  <div className="text-xs text-slate-500">
-                    สคริปต์จริงในโปรเจกต์:{' '}
-                    <code className="text-slate-800">encoder.mjs</code> ·{' '}
-                    <code className="text-slate-800">input.lua</code> ·{' '}
-                    <code className="text-slate-800">test-compare.mjs</code>
-                  </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-500 mr-1">Sample Script:</span>
+                  {LUA_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => {
+                        setActivePreset(preset.id);
+                        setLuaInput(preset.code);
+                      }}
+                      className={`px-2.5 py-1 rounded text-xs font-mono cursor-pointer ${
+                        activePreset === preset.id
+                          ? 'bg-slate-900 text-white'
+                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <code className="px-3 py-1.5 bg-slate-900 text-slate-100 rounded text-xs font-mono">
-                    node encoder.mjs input.lua output_encoded.lua
-                  </code>
-                  <code className="px-3 py-1.5 bg-slate-900 text-slate-100 rounded text-xs font-mono">
-                    node test-compare.mjs
+                  <code className="px-2.5 py-1 bg-slate-900 text-slate-100 rounded text-xs font-mono">
+                    npm run test:encoder
                   </code>
                 </div>
               </section>
 
-              {/* Two-column Workspace */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
                 {/* Left: Input Lua Editor */}
                 <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
@@ -685,15 +742,16 @@ export default function App() {
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div>
                         <div className="text-xs font-semibold text-slate-900">
-                          Source Script (input.lua)
+                          Source Lua Editor
                         </div>
                         <div className="text-xs text-slate-500">
-                          แก้ไขโค้ดเพื่อทดสอบคอมไพล์และเข้ารหัสแบบ Luraph-Style real-time
+                          รองรับ function, if/elseif/else, for, while, repeat, tables, unary/math ops
                         </div>
                       </div>
                       <button
                         type="button"
                         onClick={() => {
+                          setActivePreset('basic');
                           setLuaInput(defaultInputLua);
                           setXorKeyHex('5A');
                           setEmitterStyle('luraph');
@@ -707,7 +765,7 @@ export default function App() {
                       </button>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+                    <div className="flex flex-wrap items-center gap-2.5 pt-1 text-xs">
                       <div className="flex items-center gap-1">
                         {(
                           [
@@ -755,7 +813,9 @@ export default function App() {
                           </div>
                           <button
                             type="button"
-                            onClick={() => setSeed((s) => ((s * 1664525 + 1013904223) >>> 0) % 0xfffff)}
+                            onClick={() =>
+                              setSeed((s) => ((s * 1664525 + 1013904223) >>> 0) % 0xfffff)
+                            }
                             className="px-2 py-1 rounded border border-slate-200 font-mono text-slate-600 hover:bg-slate-50 cursor-pointer"
                             title="สุ่ม Seed ใหม่เพื่อเปลี่ยนเลข state CFF, ตาราง L และรูป literal"
                           >
@@ -780,7 +840,7 @@ export default function App() {
                     value={luaInput}
                     onChange={(e) => setLuaInput(e.target.value)}
                     spellCheck={false}
-                    rows={20}
+                    rows={22}
                     className="w-full p-4 font-mono text-xs leading-relaxed bg-slate-950 text-slate-100 focus:outline-none resize-y"
                   />
                   <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 font-mono flex items-center justify-between">
@@ -789,7 +849,10 @@ export default function App() {
                       {FORMAT_CONSTANTS.PROTO_COUNT_BIAS} · I+{FORMAT_CONSTANTS.INST_COUNT_BIAS}
                     </span>
                     <span>
-                      Mode: {parsedXorKey !== 0 ? `Deferred XOR (0x${parsedXorKey.toString(16).toUpperCase().padStart(2, '0')})` : 'Plaintext'}
+                      Mode:{' '}
+                      {parsedXorKey !== 0
+                        ? `Deferred XOR (0x${parsedXorKey.toString(16).toUpperCase().padStart(2, '0')})`
+                        : 'Plaintext'}
                     </span>
                   </div>
                 </section>
@@ -807,7 +870,6 @@ export default function App() {
                     </section>
                   ) : (
                     <>
-                      {/* Verification Comparison Card */}
                       <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                         <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                           <div className="text-xs font-semibold text-slate-900">
@@ -892,7 +954,6 @@ export default function App() {
                         </div>
                       </section>
 
-                      {/* Output Artifacts Viewer */}
                       <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                         <div className="px-4 py-2.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-1">
@@ -958,8 +1019,9 @@ export default function App() {
                         {outputMode === 'ascii85' && (
                           <div className="p-4 space-y-3">
                             <div className="text-xs text-slate-500">
-                              Ascii85 Encoded Stream (Header <code className="text-slate-800">LPH-</code>,
-                              4-byte aligned {encoderRun.decodedLength} B)
+                              Ascii85 Encoded Stream (Header{' '}
+                              <code className="text-slate-800">LPH-</code>, 4-byte aligned{' '}
+                              {encoderRun.decodedLength} B)
                             </div>
                             <pre className="p-3 rounded bg-slate-950 text-slate-100 font-mono text-xs break-all whitespace-pre-wrap max-h-60 overflow-auto">
                               {encoderRun.ascii85}
@@ -1043,6 +1105,153 @@ export default function App() {
                     </>
                   )}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 5: GITHUB REPOSITORY PACK */}
+          {activeTab === 'github' && (
+            <div className="space-y-5">
+              {/* Hero Action Strip */}
+              <section className="bg-white border border-slate-200 rounded-lg p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <h3 className="text-sm font-semibold text-slate-900">
+                    ชุดไฟล์พร้อมอัปโหลดขึ้น GitHub (GitHub-Ready Repository Pack)
+                  </h3>
+                  <p className="text-xs text-slate-600">
+                    รวมครบ {githubFiles.length} ไฟล์: <code className="text-slate-900">README.md</code>,{' '}
+                    <code className="text-slate-900">LICENSE</code>,{' '}
+                    <code className="text-slate-900">.github/workflows/ci.yml</code>,{' '}
+                    <code className="text-slate-900">decoded.lua</code>,{' '}
+                    <code className="text-slate-900">encoder.mjs</code>,{' '}
+                    <code className="text-slate-900">test-compare.mjs</code> และโฟลเดอร์{' '}
+                    <code className="text-slate-900">examples/</code>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleDownloadGithubZip}
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-slate-900 text-xs font-medium text-white hover:bg-slate-800 shrink-0 cursor-pointer"
+                >
+                  <Archive className="w-4 h-4" />
+                  Download lua-vm-reverse-encoder-github.zip
+                </button>
+              </section>
+
+              {/* Git Push Commands */}
+              <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-slate-200 flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-900">
+                    คำสั่งอัปโหลดขึ้น GitHub (หลังแตกไฟล์ .zip)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyText('gitpush', GIT_PUSH_COMMANDS)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                  >
+                    {copiedKey === 'gitpush' ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        Copy Commands
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="p-4 bg-slate-950 text-slate-100 font-mono text-xs leading-relaxed overflow-x-auto">
+                  {GIT_PUSH_COMMANDS}
+                </pre>
+              </section>
+
+              {/* File Tree + Live Inspector */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                <section className="lg:col-span-5 bg-white border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-slate-200 text-xs font-semibold text-slate-900">
+                    Repository Files ({githubFiles.length})
+                  </div>
+                  <div className="divide-y divide-slate-200">
+                    {githubFiles.map((f) => {
+                      const active = f.path === selectedRepoFileObj.path;
+                      return (
+                        <button
+                          key={f.path}
+                          type="button"
+                          onClick={() => setSelectedRepoFile(f.path)}
+                          className={`w-full text-left px-4 py-2.5 transition-colors cursor-pointer ${
+                            active ? 'bg-slate-900 text-white' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-xs font-medium truncate">
+                              {f.path}
+                            </span>
+                            <span
+                              className={`font-mono text-[11px] tabular-nums shrink-0 ${
+                                active ? 'text-slate-300' : 'text-slate-400'
+                              }`}
+                            >
+                              {f.content.length.toLocaleString()} B
+                            </span>
+                          </div>
+                          <div
+                            className={`text-[11px] mt-0.5 truncate ${
+                              active ? 'text-slate-300' : 'text-slate-500'
+                            }`}
+                          >
+                            {f.desc}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                <section className="lg:col-span-7 bg-white border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-slate-200 flex items-center justify-between gap-2">
+                    <span className="font-mono text-xs font-semibold text-slate-900 truncate">
+                      {selectedRepoFileObj.path}
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => copyText('repofile', selectedRepoFileObj.content)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        {copiedKey === 'repofile' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            Copy
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          downloadTextFile(
+                            selectedRepoFileObj.path.split('/').pop() || selectedRepoFileObj.path,
+                            selectedRepoFileObj.content
+                          )
+                        }
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        Download
+                      </button>
+                    </div>
+                  </div>
+                  <pre className="p-4 bg-slate-950 text-slate-100 font-mono text-[11px] leading-relaxed max-h-[540px] overflow-auto whitespace-pre-wrap break-words">
+                    {selectedRepoFileObj.content}
+                  </pre>
+                </section>
               </div>
             </div>
           )}

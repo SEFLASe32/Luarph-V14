@@ -5,28 +5,26 @@
  * จำลองอัลกอริทึมการเข้ารหัสแบบย้อนกลับ (Reverse Encoding Simulator)
  * ตามโครงสร้างที่วิเคราะห์ได้จาก Luraph v14.3 (loader.lua_5e4ba8d7.txt):
  *
- *   1. Mini-Compiler: แปลงโค้ด Lua ตัวอย่าง -> Register-based VM Bytecode
- *      (ใช้ชุด Opcode และโครงสร้าง Prototype เดียวกับที่แกะได้:
- *       OP 34 LOADK, OP 12 GETGLOBAL, OP 2 ADD, OP 102 MUL, OP 42 CONCAT,
- *       OP 25/46 FORPREP/FORLOOP, OP 20 CALL, OP 69 RETURN, OP 90 CLOSURE, ฯลฯ)
+ *   1. Lua-to-VM Compiler: รองรับ local, function, if/elseif/else, for, while,
+ *      repeat..until, tables ({}, t.k, t[i]), arithmetic (+ - * / % ^),
+ *      unary (-, not, #), concat (..), comparisons (== ~= < <= > >=), and/or, return
  *   2. Binary Serializer: เข้ารหัส Chunk ด้วยรูปแบบเดียวกับไฟล์ต้นฉบับ:
  *      - Constant count biased ด้วย +0x12074 (73844) แบบ Unsigned LEB128
- *      - Deferred flag byte (รองรับ XOR string encryption mode เหมือน Stage 2)
+ *      - Deferred flag byte (รองรับ XOR string encryption mode + I[2]/I[3] patching)
  *      - Constant tags: <=8 (int64 <i8), 9..13 (float64 <d), 0xE3 (bool), 0xE6 (str)
- *      - Prototype count biased ด้วย +0xE81A (59418)
- *      - Line info เข้ารหัสแบบ RLE (uint32 LE)
+ *      - Prototype count biased ด้วย +0xE81A (59418), RLE Line info (uint32 LE)
  *      - Instruction count biased ด้วย +39325
  *      - แต่ละคำสั่ง: 3 Signed 53-bit LEB128 operands (`val * 8 + mode`) + opcode
- *   3. Ascii85 (Base85) Encoder:
- *      - แปลง 4-byte Big-Endian chunks -> 5 ตัวอักษรฐาน 85 (offset 33)
- *      - บีบอัด 0x00000000 เป็นตัวอักษร 'z'
- *      - ใส่ Header "LPH-"
- *   4. Lua Output Generator:
- *      - สร้างไฟล์ Lua แบบ Self-contained ที่มี Ascii85 Decoder, Binary Reader,
- *        Chunk Deserializer และ Register VM Runtime พร้อมรันได้จริง
+ *   3. Ascii85 (Base85) Encoder ("LPH-" header + 'z' compression + >I4 chunks)
+ *   4. Luraph v14.3-Style Obfuscated Lua Emitter:
+ *      - Wrapper Argument Injection (ส่ง stdlib, bit32 table C, key table L)
+ *      - Control-Flow Flattening (CFF) ด้วยลูป while true + state p + memoized R + bit32
+ *      - Number & String Literal Obfuscation (0X..., 0B..., underscores, \ddd, \xHH, \u{}, \z)
+ *      - Full 104-Opcode (0..103) 7-Level Balanced Binary-Search if/else VM Dispatch Tree
  * -----------------------------------------------------------------------------
  * วิธีใช้:
- *   node encoder.mjs [input.lua] [output_encoded.lua] [--xor-key=0x5A]
+ *   node encoder.mjs [input.lua] [output_encoded.lua]
+ *                    [--xor-key=0x5A] [--dialect=luau|lua53] [--seed=0x143A7] [--readable]
  */
 
 import fs from 'node:fs';
@@ -37,39 +35,54 @@ import path from 'node:path';
 // =============================================================================
 export const FORMAT_CONSTANTS = {
   HEADER_MAGIC: 'LPH-',
-  CONST_COUNT_BIAS: 0x12074,       // 73844
-  PROTO_COUNT_BIAS: 0xe81a,        // 59418
+  CONST_COUNT_BIAS: 0x12074, // 73844
+  PROTO_COUNT_BIAS: 0xe81a, // 59418
   INST_COUNT_BIAS: 39325,
-  TAG_INT64: 8,                    // <= 8
-  TAG_FLOAT64: 13,                 // 9..13
-  TAG_BOOL: 0xe3,                  // 227
-  TAG_STRING: 0xe6,                // 230
+  TAG_INT64: 8, // <= 8
+  TAG_FLOAT64: 13, // 9..13
+  TAG_BOOL: 0xe3, // 227
+  TAG_STRING: 0xe6, // 230
   SIGNED_THRESHOLD: 4503599627370496, // 2^52
-  SIGNED_MODULUS: 9007199254740992,   // 2^53
+  SIGNED_MODULUS: 9007199254740992, // 2^53
 };
 
-// Opcode subset ที่ตรงกับเลข Opcode ใน loader.lua_5e4ba8d7.txt
+// Opcode map ที่ตรงกับเลข Opcode ใน loader.lua_5e4ba8d7.txt
 export const OP = {
   NOP: 0,
-  ADD: 2,         // R[C] = R[B] + R[A]
-  JMP: 5,         // pc = B
-  GETGLOBAL: 12,  // R[B] = env[A_const]
-  SUB: 17,        // R[C] = R[B] - R[A]
-  CALL: 20,       // R[B].. = R[B](R[B+1]..R[B+C-1]), A = nRets+1
-  FORPREP: 25,    // init numeric for loop at R[A], jump C
-  LOADK: 34,      // R[A] = C_const
-  CONCAT: 42,     // R[C] = R[B] .. R[A]
-  FORLOOP: 46,    // step numeric for loop, store R[B+3], jump C
-  MOVE: 47,       // R[A] = R[C]
-  RETURN0: 57,    // return
-  SETGLOBAL: 64,  // env[C_const] = R[A]
-  ADDK: 68,       // R[A] = R[B] + C_const
-  RETURN1: 69,    // return R[B]
-  LOADARGS: 86,   // for i=1..B do R[i] = args[i]
-  EQ: 88,         // R[C] = (R[B] == R[A])
-  CLOSURE: 90,    // R[A] = closure(B_const)
-  LOOP_POP: 99,   // pop loop frame
-  MUL: 102,       // R[B] = R[A] * R[C]
+  ADD: 2, // R[C] = R[B] + R[A]
+  JMP: 5, // pc = B
+  NEWTABLE: 11, // R[B] = {}
+  GETGLOBAL: 12, // R[B] = env[A_const]
+  LEN: 14, // R[B] = #R[C]
+  SUB: 17, // R[C] = R[B] - R[A]
+  CALL: 20, // R[B].. = R[B](R[B+1]..R[B+C-1]), A = nRets+1
+  GETTABLE: 23, // R[A] = R[B][R[C]]
+  FORPREP: 25, // init numeric for loop at R[A], jump C
+  GETTABLE_K: 32, // R[A] = R[C][B_const]
+  LOADK: 34, // R[A] = C_const
+  CONCAT: 42, // R[C] = R[B] .. R[A]
+  MOD: 44, // R[A] = R[B] % R[C]
+  FORLOOP: 46, // step numeric for loop, store R[B+3], jump C
+  MOVE: 47, // R[A] = R[C]
+  TEST_FALSE: 51, // if not R[B] then pc = C end
+  RETURN0: 57, // return
+  LT: 58, // R[A] = (R[B] < R[C])
+  POW: 59, // R[A] = R[C] ^ R[B]
+  NOT: 61, // R[A] = not R[B]
+  SETGLOBAL: 64, // env[C_const] = R[A]
+  ADDK: 68, // R[A] = R[B] + C_const
+  RETURN1: 69, // return R[B]
+  UNM: 75, // R[B] = -R[A]
+  DIV: 81, // R[A] = R[C] / R[B]
+  LOADNIL: 82, // R[A] = nil
+  SETTABLE_KR: 85, // R[A][B_const] = R[C]
+  LOADARGS: 86, // for i=1..B do R[i] = args[i]
+  LE: 87, // R[A] = (R[B] <= R[C])
+  EQ: 88, // R[C] = (R[B] == R[A])
+  CLOSURE: 90, // R[A] = closure(B_const)
+  SETTABLE: 94, // R[C][R[A]] = R[B]
+  LOOP_POP: 99, // pop loop frame
+  MUL: 102, // R[B] = R[A] * R[C]
 };
 
 // Operand modes (3 บิตล่างของแต่ละ operand)
@@ -143,7 +156,6 @@ export class BinaryWriter {
 // 3. Ascii85 (Base85) Encoder & Decoder ("LPH-" format)
 // =============================================================================
 export function encodeAscii85(buffer) {
-  // Pad ให้ครบพหุคูณของ 4 ไบต์ (เนื่องจาก decoder อ่านทีละ 5 chars -> 4 bytes)
   const padLen = (4 - (buffer.length % 4)) % 4;
   const padded = padLen > 0 ? Buffer.concat([buffer, Buffer.alloc(padLen)]) : buffer;
 
@@ -210,7 +222,6 @@ export function serializeChunk(chunk, { xorKey = 0 } = {}) {
   const w = new BinaryWriter();
   const deferred = xorKey !== 0;
 
-  // 1) Constant Pool
   w.writeVarint(chunk.consts.length + FORMAT_CONSTANTS.CONST_COUNT_BIAS);
   w.writeByte(deferred ? 1 : 0);
 
@@ -235,27 +246,23 @@ export function serializeChunk(chunk, { xorKey = 0 } = {}) {
     }
   }
 
-  // 2) Prototypes
   w.writeVarint(chunk.protos.length + FORMAT_CONSTANTS.PROTO_COUNT_BIAS);
   for (const p of chunk.protos) {
-    // RLE Line info (1 entry per instruction for simplicity)
     w.writeUInt32(p.insts.length);
     for (let i = 0; i < p.insts.length; i++) {
       const line = p.insts[i].line || 1;
-      w.writeUInt32(line * 2); // even -> single PC line entry
+      w.writeUInt32(line * 2);
     }
 
     w.writeVarint(p.maxStack);
     w.writeVarint(p.numParams);
 
-    // Upvalues
     const upvals = p.upvals || [];
     w.writeVarint(upvals.length);
     for (const uv of upvals) {
       w.writeVarint(uv.idx * 4 + uv.kind);
     }
 
-    // Instructions
     w.writeVarint(p.insts.length + FORMAT_CONSTANTS.INST_COUNT_BIAS);
     for (const inst of p.insts) {
       const rawA = (inst.A || 0) * 8 + (inst.modeA || MODE.NONE);
@@ -268,19 +275,34 @@ export function serializeChunk(chunk, { xorKey = 0 } = {}) {
     }
   }
 
-  // 3) Entry Prototype Index (1-based)
   w.writeVarint(chunk.entryIdx);
   return w.toBuffer();
 }
 
 export function deserializeChunk(buf, { xorKey = 0 } = {}) {
   let pos = 0;
-  const readByte = () => buf[pos++];
-  const readU32 = () => { const v = buf.readUInt32LE(pos); pos += 4; return v; };
-  const readI64 = () => { const v = buf.readBigInt64LE(pos); pos += 8; return Number(v); };
-  const readF64 = () => { const v = buf.readDoubleLE(pos); pos += 8; return v; };
+  const readByte = () => {
+    if (pos >= buf.length) throw new Error('Unexpected EOF while deserializing chunk');
+    return buf[pos++];
+  };
+  const readU32 = () => {
+    const v = buf.readUInt32LE(pos);
+    pos += 4;
+    return v;
+  };
+  const readI64 = () => {
+    const v = buf.readBigInt64LE(pos);
+    pos += 8;
+    return Number(v);
+  };
+  const readF64 = () => {
+    const v = buf.readDoubleLE(pos);
+    pos += 8;
+    return v;
+  };
   const readVarint = () => {
-    let res = 0, mul = 1;
+    let res = 0;
+    let mul = 1;
     while (true) {
       const b = readByte();
       res += (b > 127 ? b - 128 : b) * mul;
@@ -357,9 +379,15 @@ export function deserializeChunk(buf, { xorKey = 0 } = {}) {
       const C = (rawC - modeC) / 8;
       const inst = {
         op,
-        A, modeA, Ak: modeA === MODE.CONST ? consts[A] : undefined,
-        B, modeB, Bk: modeB === MODE.CONST ? consts[B] : undefined,
-        C, modeC, Ck: modeC === MODE.CONST ? consts[C] : undefined,
+        A,
+        modeA,
+        Ak: modeA === MODE.CONST ? consts[A] : undefined,
+        B,
+        modeB,
+        Bk: modeB === MODE.CONST ? consts[B] : undefined,
+        C,
+        modeC,
+        Ck: modeC === MODE.CONST ? consts[C] : undefined,
         line: lines[i + 1] || 1,
       };
       if (modeA === MODE.PROTO) patchList.push([inst, 'Ak', A]);
@@ -378,7 +406,9 @@ export function deserializeChunk(buf, { xorKey = 0 } = {}) {
 }
 
 // =============================================================================
-// 5. Mini Lua-to-Luraph-VM Compiler (คอมไพล์ Subset ของ Lua เป็น Bytecode)
+// 5. Expanded Lua-to-Luraph-VM Compiler
+//    รองรับ: local, function, if/elseif/else, for, while, repeat..until, tables,
+//    arithmetic (+ - * / % ^), unary (- not #), concat (..), comparisons, and/or
 // =============================================================================
 export function compileLuaToChunk(luaSource) {
   const consts = [];
@@ -387,29 +417,66 @@ export function compileLuaToChunk(luaSource) {
     const key = `${typeof val}:${String(val)}`;
     if (constMap.has(key)) return constMap.get(key);
     consts.push(val);
-    const idx = consts.length; // 1-based
+    const idx = consts.length;
     constMap.set(key, idx);
     return idx;
   };
 
-  // Tokenizer สำหรับ Lua subset (local, function, for, return, print, strings, numbers, ops)
+  const KEYWORDS = new Set([
+    'local',
+    'function',
+    'for',
+    'while',
+    'repeat',
+    'until',
+    'if',
+    'then',
+    'elseif',
+    'else',
+    'do',
+    'end',
+    'return',
+    'true',
+    'false',
+    'nil',
+    'not',
+    'and',
+    'or',
+  ]);
+
   const tokenize = (src) => {
     const tokens = [];
-    let i = 0, line = 1;
+    let i = 0;
+    let line = 1;
     while (i < src.length) {
       const ch = src[i];
-      if (ch === '\n') { line++; i++; continue; }
-      if (/\s/.test(ch)) { i++; continue; }
+      if (ch === '\n') {
+        line++;
+        i++;
+        continue;
+      }
+      if (/\s/.test(ch)) {
+        i++;
+        continue;
+      }
       if (ch === '-' && src[i + 1] === '-') {
         while (i < src.length && src[i] !== '\n') i++;
         continue;
       }
       if (ch === '"' || ch === "'") {
-        const quote = ch; i++;
+        const quote = ch;
+        i++;
         let s = '';
         while (i < src.length && src[i] !== quote) {
-          if (src[i] === '\\') { i++; s += src[i] === 'n' ? '\n' : src[i]; }
-          else s += src[i];
+          if (src[i] === '\\') {
+            i++;
+            if (src[i] === 'n') s += '\n';
+            else if (src[i] === 't') s += '\t';
+            else if (src[i] === 'r') s += '\r';
+            else s += src[i];
+          } else {
+            s += src[i];
+          }
           i++;
         }
         i++;
@@ -418,6 +485,13 @@ export function compileLuaToChunk(luaSource) {
       }
       if (/[0-9]/.test(ch)) {
         let num = '';
+        if (ch === '0' && (src[i + 1] === 'x' || src[i + 1] === 'X')) {
+          num = src.slice(i, i + 2);
+          i += 2;
+          while (i < src.length && /[0-9a-fA-F]/.test(src[i])) num += src[i++];
+          tokens.push({ type: 'NUM', val: Number.parseInt(num.slice(2), 16), line });
+          continue;
+        }
         while (i < src.length && /[0-9.]/.test(src[i])) num += src[i++];
         tokens.push({ type: 'NUM', val: Number(num), line });
         continue;
@@ -425,14 +499,14 @@ export function compileLuaToChunk(luaSource) {
       if (/[A-Za-z_]/.test(ch)) {
         let id = '';
         while (i < src.length && /[A-Za-z0-9_]/.test(src[i])) id += src[i++];
-        const kw = ['local', 'function', 'for', 'do', 'end', 'return', 'true', 'false'];
-        tokens.push({ type: kw.includes(id) ? 'KW' : 'ID', val: id, line });
+        tokens.push({ type: KEYWORDS.has(id) ? 'KW' : 'ID', val: id, line });
         continue;
       }
       const two = src.slice(i, i + 2);
       if (['..', '==', '~=', '<=', '>='].includes(two)) {
         tokens.push({ type: 'OP', val: two, line });
-        i += 2; continue;
+        i += 2;
+        continue;
       }
       tokens.push({ type: 'SYM', val: ch, line });
       i++;
@@ -466,24 +540,87 @@ export function compileLuaToChunk(luaSource) {
     };
 
     if (params.length > 0) {
-      insts.push({ op: OP.LOADARGS, A: 0, modeA: 0, B: params.length, modeB: MODE.REG, C: 0, modeC: 0, line: 1 });
+      insts.push({
+        op: OP.LOADARGS,
+        A: 0,
+        modeA: 0,
+        B: params.length,
+        modeB: MODE.REG,
+        C: 0,
+        modeC: 0,
+        line: 1,
+      });
       for (const p of params) locals.set(p, allocReg());
     }
 
-    const emit = (inst) => { insts.push(inst); return insts.length; };
+    const emit = (inst) => {
+      insts.push(inst);
+      return insts.length;
+    };
 
     function compileExpr(targetReg) {
-      return compileCompare(targetReg);
+      return compileOr(targetReg);
+    }
+
+    function compileOr(targetReg) {
+      let left = compileAnd(targetReg);
+      while (peek().type === 'KW' && peek().val === 'or') {
+        const opTok = next();
+        const dest = targetReg ?? allocReg();
+        if (left !== dest) {
+          emit({ op: OP.MOVE, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        // if dest is truthy, skip RHS
+        const notReg = allocReg();
+        emit({ op: OP.NOT, A: notReg, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: opTok.line });
+        const skipRhs = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: notReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: opTok.line });
+        compileAnd(dest);
+        insts[skipRhs - 1].C = insts.length;
+        left = dest;
+      }
+      return left;
+    }
+
+    function compileAnd(targetReg) {
+      let left = compileCompare(targetReg);
+      while (peek().type === 'KW' && peek().val === 'and') {
+        const opTok = next();
+        const dest = targetReg ?? allocReg();
+        if (left !== dest) {
+          emit({ op: OP.MOVE, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        const skipRhs = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: dest, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: opTok.line });
+        compileCompare(dest);
+        insts[skipRhs - 1].C = insts.length;
+        left = dest;
+      }
+      return left;
     }
 
     function compileCompare(targetReg) {
-      const left = compileConcat(targetReg);
-      while (peek().type === 'OP' && peek().val === '==') {
+      let left = compileConcat(targetReg);
+      while (
+        (peek().type === 'OP' && ['==', '~=', '<=', '>='].includes(peek().val)) ||
+        (peek().type === 'SYM' && (peek().val === '<' || peek().val === '>'))
+      ) {
         const opTok = next();
         const right = compileConcat(allocReg());
         const dest = targetReg ?? allocReg();
-        emit({ op: OP.EQ, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
-        return dest;
+        if (opTok.val === '==') {
+          emit({ op: OP.EQ, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '~=') {
+          emit({ op: OP.EQ, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
+          emit({ op: OP.NOT, A: dest, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: opTok.line });
+        } else if (opTok.val === '<') {
+          emit({ op: OP.LT, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '>') {
+          emit({ op: OP.LT, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '<=') {
+          emit({ op: OP.LE, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '>=') {
+          emit({ op: OP.LE, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        left = dest;
       }
       return left;
     }
@@ -501,16 +638,19 @@ export function compileLuaToChunk(luaSource) {
     }
 
     function compileAddSub(targetReg) {
-      let left = compileMul(targetReg);
+      let left = compileMulDivMod(targetReg);
       while (peek().type === 'SYM' && (peek().val === '+' || peek().val === '-')) {
         const opTok = next();
-        const right = compileMul(allocReg());
+        const right = compileMulDivMod(allocReg());
         const dest = targetReg ?? allocReg();
         emit({
           op: opTok.val === '+' ? OP.ADD : OP.SUB,
-          A: right, modeA: MODE.REG,
-          B: left, modeB: MODE.REG,
-          C: dest, modeC: MODE.REG,
+          A: right,
+          modeA: MODE.REG,
+          B: left,
+          modeB: MODE.REG,
+          C: dest,
+          modeC: MODE.REG,
           line: opTok.line,
         });
         left = dest;
@@ -518,25 +658,161 @@ export function compileLuaToChunk(luaSource) {
       return left;
     }
 
-    function compileMul(targetReg) {
-      let left = compilePrimary(targetReg);
-      while (peek().type === 'SYM' && peek().val === '*') {
+    function compileMulDivMod(targetReg) {
+      let left = compileUnary(targetReg);
+      while (peek().type === 'SYM' && (peek().val === '*' || peek().val === '/' || peek().val === '%')) {
         const opTok = next();
-        const right = compilePrimary(allocReg());
+        const right = compileUnary(allocReg());
         const dest = targetReg ?? allocReg();
-        emit({ op: OP.MUL, A: left, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        if (opTok.val === '*') {
+          emit({ op: OP.MUL, A: left, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '/') {
+          // DIV: R[A] = R[C] / R[B]
+          emit({ op: OP.DIV, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        } else {
+          // MOD: R[A] = R[B] % R[C]
+          emit({ op: OP.MOD, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        }
         left = dest;
       }
       return left;
+    }
+
+    function compileUnary(targetReg) {
+      const t = peek();
+      if (t.type === 'SYM' && t.val === '-') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.UNM, A: operand, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        return dest;
+      }
+      if (t.type === 'KW' && t.val === 'not') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.NOT, A: dest, modeA: MODE.REG, B: operand, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        return dest;
+      }
+      if (t.type === 'SYM' && t.val === '#') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.LEN, A: 0, modeA: 0, B: dest, modeB: MODE.REG, C: operand, modeC: MODE.REG, line: t.line });
+        return dest;
+      }
+      return compilePow(targetReg);
+    }
+
+    function compilePow(targetReg) {
+      const left = compilePrimary(targetReg);
+      if (peek().type === 'SYM' && peek().val === '^') {
+        const opTok = next();
+        const right = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        // POW: R[A] = R[C] ^ R[B]
+        emit({ op: OP.POW, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        return dest;
+      }
+      return left;
+    }
+
+    function compilePostfix(reg, targetReg, startLine) {
+      let cur = reg;
+      while (true) {
+        if (peek().type === 'SYM' && peek().val === '.') {
+          next();
+          const fieldTok = next();
+          const kIdx = addConst(fieldTok.val);
+          const nextRegOut = allocReg();
+          // GETTABLE_K: R[A] = R[C][B_const]
+          emit({ op: OP.GETTABLE_K, A: nextRegOut, modeA: MODE.REG, B: kIdx, modeB: MODE.CONST, C: cur, modeC: MODE.REG, line: fieldTok.line });
+          cur = nextRegOut;
+        } else if (peek().type === 'SYM' && peek().val === '[') {
+          const lb = next();
+          const keyReg = compileExpr(allocReg());
+          expect(']');
+          const nextRegOut = allocReg();
+          // GETTABLE: R[A] = R[B][R[C]]
+          emit({ op: OP.GETTABLE, A: nextRegOut, modeA: MODE.REG, B: cur, modeB: MODE.REG, C: keyReg, modeC: MODE.REG, line: lb.line });
+          cur = nextRegOut;
+        } else if (peek().type === 'SYM' && peek().val === '(') {
+          next();
+          const argRegs = [];
+          if (!(peek().type === 'SYM' && peek().val === ')')) {
+            while (true) {
+              argRegs.push(compileExpr(allocReg()));
+              if (peek().type === 'SYM' && peek().val === ',') next();
+              else break;
+            }
+          }
+          expect(')');
+          const callBase = allocReg();
+          emit({ op: OP.MOVE, A: callBase, modeA: MODE.REG, B: 0, modeB: 0, C: cur, modeC: MODE.REG, line: startLine });
+          for (let ai = 0; ai < argRegs.length; ai++) {
+            const slot = allocReg();
+            emit({ op: OP.MOVE, A: slot, modeA: MODE.REG, B: 0, modeB: 0, C: argRegs[ai], modeC: MODE.REG, line: startLine });
+          }
+          emit({ op: OP.CALL, A: 2, modeA: MODE.REG, B: callBase, modeB: MODE.REG, C: argRegs.length + 1, modeC: MODE.REG, line: startLine });
+          cur = callBase;
+        } else {
+          break;
+        }
+      }
+      if (targetReg !== undefined && targetReg !== cur) {
+        emit({ op: OP.MOVE, A: targetReg, modeA: MODE.REG, B: 0, modeB: 0, C: cur, modeC: MODE.REG, line: startLine });
+        return targetReg;
+      }
+      return cur;
     }
 
     function compilePrimary(targetReg) {
       const t = peek();
       if (t.type === 'SYM' && t.val === '(') {
         next();
-        const r = compileExpr(targetReg);
+        const r = compileExpr(allocReg());
         expect(')');
-        return r;
+        return compilePostfix(r, targetReg, t.line);
+      }
+      if (t.type === 'SYM' && t.val === '{') {
+        next();
+        const tblReg = targetReg ?? allocReg();
+        emit({ op: OP.NEWTABLE, A: 0, modeA: 0, B: tblReg, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        let arrIdx = 1;
+        while (!(peek().type === 'SYM' && peek().val === '}')) {
+          if (peek().type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
+            const kTok = next();
+            expect('=');
+            const valReg = compileExpr(allocReg());
+            const kIdx = addConst(kTok.val);
+            // SETTABLE_KR: R[A][B_const] = R[C]
+            emit({ op: OP.SETTABLE_KR, A: tblReg, modeA: MODE.REG, B: kIdx, modeB: MODE.CONST, C: valReg, modeC: MODE.REG, line: kTok.line });
+          } else if (peek().type === 'SYM' && peek().val === '[') {
+            next();
+            const keyReg = compileExpr(allocReg());
+            expect(']');
+            expect('=');
+            const valReg = compileExpr(allocReg());
+            // SETTABLE: R[C][R[A]] = R[B]
+            emit({ op: OP.SETTABLE, A: keyReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: tblReg, modeC: MODE.REG, line: t.line });
+          } else {
+            const valReg = compileExpr(allocReg());
+            const idxReg = allocReg();
+            const kIdx = addConst(arrIdx++);
+            emit({ op: OP.LOADK, A: idxReg, modeA: MODE.REG, B: 0, modeB: 0, C: kIdx, modeC: MODE.CONST, line: t.line });
+            emit({ op: OP.SETTABLE, A: idxReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: tblReg, modeC: MODE.REG, line: t.line });
+          }
+          if (peek().type === 'SYM' && (peek().val === ',' || peek().val === ';')) next();
+          else break;
+        }
+        expect('}');
+        return tblReg;
+      }
+      if (t.type === 'KW' && t.val === 'nil') {
+        next();
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.LOADNIL, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: 0, line: t.line });
+        return dest;
       }
       if (t.type === 'NUM' || t.type === 'STR' || (t.type === 'KW' && (t.val === 'true' || t.val === 'false'))) {
         next();
@@ -550,58 +826,26 @@ export function compileLuaToChunk(luaSource) {
         next();
         let reg;
         if (locals.has(t.val)) {
-          const src = locals.get(t.val);
-          if (targetReg !== undefined && targetReg !== src) {
-            emit({ op: OP.MOVE, A: targetReg, modeA: MODE.REG, B: 0, modeB: 0, C: src, modeC: MODE.REG, line: t.line });
-            reg = targetReg;
-          } else {
-            reg = src;
-          }
+          reg = locals.get(t.val);
         } else {
-          const dest = targetReg ?? allocReg();
+          const dest = allocReg();
           const kIdx = addConst(t.val);
           emit({ op: OP.GETGLOBAL, A: kIdx, modeA: MODE.CONST, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
           reg = dest;
         }
-        // Function call
-        if (peek().type === 'SYM' && peek().val === '(') {
-          const callBase = allocReg();
-          emit({ op: OP.MOVE, A: callBase, modeA: MODE.REG, B: 0, modeB: 0, C: reg, modeC: MODE.REG, line: t.line });
-          next(); // '('
-          let argCount = 0;
-          if (!(peek().type === 'SYM' && peek().val === ')')) {
-            while (true) {
-              const argReg = allocReg();
-              compileExpr(argReg);
-              argCount++;
-              if (peek().type === 'SYM' && peek().val === ',') next();
-              else break;
-            }
-          }
-          expect(')');
-          emit({
-            op: OP.CALL,
-            A: 2, modeA: MODE.REG, // expect 1 return value
-            B: callBase, modeB: MODE.REG,
-            C: argCount + 1, modeC: MODE.REG,
-            line: t.line,
-          });
-          if (targetReg !== undefined && targetReg !== callBase) {
-            emit({ op: OP.MOVE, A: targetReg, modeA: MODE.REG, B: 0, modeB: 0, C: callBase, modeC: MODE.REG, line: t.line });
-            return targetReg;
-          }
-          return callBase;
-        }
-        return reg;
+        return compilePostfix(reg, targetReg, t.line);
       }
       throw new SyntaxError(`Line ${t.line}: unexpected token '${t.val}'`);
     }
 
-    while (peek().type !== 'EOF') {
-      if (stopAtEnd && peek().type === 'KW' && peek().val === 'end') {
-        next();
-        break;
+    function compileStatementsUntil(stopSet) {
+      while (peek().type !== 'EOF') {
+        if (peek().type === 'KW' && stopSet.has(peek().val)) break;
+        compileStatement();
       }
+    }
+
+    function compileStatement() {
       const t = peek();
       if (t.type === 'KW' && t.val === 'local') {
         next();
@@ -624,19 +868,70 @@ export function compileLuaToChunk(luaSource) {
           emit({ op: OP.CLOSURE, A: fnReg, modeA: MODE.REG, B: subProtoIdx, modeB: MODE.PROTO, C: 0, modeC: 0, line: nameTok.line });
         } else {
           const nameTok = next();
-          expect('=');
           const varReg = allocReg();
-          compileExpr(varReg);
+          if (peek().type === 'SYM' && peek().val === '=') {
+            next();
+            compileExpr(varReg);
+          } else {
+            emit({ op: OP.LOADNIL, A: varReg, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: 0, line: nameTok.line });
+          }
           locals.set(nameTok.val, varReg);
         }
+      } else if (t.type === 'KW' && t.val === 'if') {
+        next();
+        const exitJumps = [];
+        const condReg = compileExpr(allocReg());
+        expect('then');
+        let jFalse = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: t.line });
+        compileStatementsUntil(new Set(['elseif', 'else', 'end']));
+
+        while (peek().type === 'KW' && peek().val === 'elseif') {
+          const eiTok = next();
+          exitJumps.push(emit({ op: OP.JMP, A: 0, modeA: 0, B: 0, modeB: MODE.REG, C: 0, modeC: 0, line: eiTok.line }));
+          insts[jFalse - 1].C = insts.length;
+          const eiCond = compileExpr(allocReg());
+          expect('then');
+          jFalse = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: eiCond, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: eiTok.line });
+          compileStatementsUntil(new Set(['elseif', 'else', 'end']));
+        }
+
+        if (peek().type === 'KW' && peek().val === 'else') {
+          const elTok = next();
+          exitJumps.push(emit({ op: OP.JMP, A: 0, modeA: 0, B: 0, modeB: MODE.REG, C: 0, modeC: 0, line: elTok.line }));
+          insts[jFalse - 1].C = insts.length;
+          compileStatementsUntil(new Set(['end']));
+        } else {
+          insts[jFalse - 1].C = insts.length;
+        }
+        expect('end');
+        for (const jp of exitJumps) {
+          insts[jp - 1].B = insts.length;
+        }
+      } else if (t.type === 'KW' && t.val === 'while') {
+        next();
+        const loopStart = insts.length;
+        const condReg = compileExpr(allocReg());
+        expect('do');
+        const jExit = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: t.line });
+        compileStatementsUntil(new Set(['end']));
+        expect('end');
+        emit({ op: OP.JMP, A: 0, modeA: 0, B: loopStart, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        insts[jExit - 1].C = insts.length;
+      } else if (t.type === 'KW' && t.val === 'repeat') {
+        next();
+        const loopStart = insts.length;
+        compileStatementsUntil(new Set(['until']));
+        const uTok = expect('until');
+        const condReg = compileExpr(allocReg());
+        emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: loopStart, modeC: MODE.REG, line: uTok.line });
       } else if (t.type === 'KW' && t.val === 'for') {
         next();
         const varTok = next();
         expect('=');
-        const base = allocReg(); // start
+        const base = allocReg();
         const limitReg = allocReg();
         const stepReg = allocReg();
-        const loopVarReg = allocReg(); // base + 3
+        const loopVarReg = allocReg();
         compileExpr(base);
         expect(',');
         compileExpr(limitReg);
@@ -649,34 +944,28 @@ export function compileLuaToChunk(luaSource) {
         }
         expect('do');
         const prepPc = emit({ op: OP.FORPREP, A: base, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: MODE.REG, line: varTok.line });
-        const bodyStartPc = insts.length; // 1-based PC before first body inst (since VM increments pc++)
+        const bodyStartPc = insts.length;
         const prevLocal = locals.get(varTok.val);
         locals.set(varTok.val, loopVarReg);
-        while (!(peek().type === 'KW' && peek().val === 'end')) {
-          compileSingleStmt();
-        }
+        compileStatementsUntil(new Set(['end']));
         expect('end');
         if (prevLocal === undefined) locals.delete(varTok.val);
         else locals.set(varTok.val, prevLocal);
         const loopPc = emit({ op: OP.FORLOOP, A: 0, modeA: 0, B: base, modeB: MODE.REG, C: bodyStartPc, modeC: MODE.REG, line: varTok.line });
-        insts[prepPc - 1].C = loopPc - 1; // FORPREP jumps right before FORLOOP
+        insts[prepPc - 1].C = loopPc - 1;
         emit({ op: OP.LOOP_POP, A: 0, modeA: 0, B: 0, modeB: 0, C: 0, modeC: 0, line: varTok.line });
       } else if (t.type === 'KW' && t.val === 'return') {
         next();
-        if (peek().type === 'EOF' || (peek().type === 'KW' && peek().val === 'end')) {
+        if (
+          peek().type === 'EOF' ||
+          (peek().type === 'KW' && ['end', 'else', 'elseif', 'until'].includes(peek().val))
+        ) {
           emit({ op: OP.RETURN0, A: 0, modeA: 0, B: 0, modeB: 0, C: 0, modeC: 0, line: t.line });
         } else {
           const r = compileExpr();
           emit({ op: OP.RETURN1, A: 0, modeA: 0, B: r, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
         }
-      } else {
-        compileSingleStmt();
-      }
-    }
-
-    function compileSingleStmt() {
-      const t = peek();
-      if (t.type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
+      } else if (t.type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
         next();
         expect('=');
         if (locals.has(t.val)) {
@@ -686,17 +975,70 @@ export function compileLuaToChunk(luaSource) {
           const kIdx = addConst(t.val);
           emit({ op: OP.SETGLOBAL, A: r, modeA: MODE.REG, B: 0, modeB: 0, C: kIdx, modeC: MODE.CONST, line: t.line });
         }
+      } else if (t.type === 'ID' && peek(1).type === 'SYM' && (peek(1).val === '.' || peek(1).val === '[')) {
+        // Table field/index assignment or call
+        const savedPos = tPos;
+        const baseTok = next();
+        let curReg;
+        if (locals.has(baseTok.val)) {
+          curReg = locals.get(baseTok.val);
+        } else {
+          curReg = allocReg();
+          const kIdx = addConst(baseTok.val);
+          emit({ op: OP.GETGLOBAL, A: kIdx, modeA: MODE.CONST, B: curReg, modeB: MODE.REG, C: 0, modeC: 0, line: baseTok.line });
+        }
+        let lastAccess = null;
+        while (peek().type === 'SYM' && (peek().val === '.' || peek().val === '[')) {
+          if (lastAccess) {
+            const nextR = allocReg();
+            if (lastAccess.kind === 'dot') {
+              emit({ op: OP.GETTABLE_K, A: nextR, modeA: MODE.REG, B: lastAccess.kIdx, modeB: MODE.CONST, C: curReg, modeC: MODE.REG, line: baseTok.line });
+            } else {
+              emit({ op: OP.GETTABLE, A: nextR, modeA: MODE.REG, B: curReg, modeB: MODE.REG, C: lastAccess.keyReg, modeC: MODE.REG, line: baseTok.line });
+            }
+            curReg = nextR;
+          }
+          if (peek().val === '.') {
+            next();
+            const fTok = next();
+            lastAccess = { kind: 'dot', kIdx: addConst(fTok.val), line: fTok.line };
+          } else {
+            const lb = next();
+            const keyReg = compileExpr(allocReg());
+            expect(']');
+            lastAccess = { kind: 'bracket', keyReg, line: lb.line };
+          }
+        }
+        if (peek().type === 'SYM' && peek().val === '=') {
+          next();
+          const valReg = compileExpr(allocReg());
+          if (lastAccess.kind === 'dot') {
+            emit({ op: OP.SETTABLE_KR, A: curReg, modeA: MODE.REG, B: lastAccess.kIdx, modeB: MODE.CONST, C: valReg, modeC: MODE.REG, line: lastAccess.line });
+          } else {
+            emit({ op: OP.SETTABLE, A: lastAccess.keyReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: curReg, modeC: MODE.REG, line: lastAccess.line });
+          }
+        } else {
+          // Not an assignment — rewind and compile as expression
+          tPos = savedPos;
+          compileExpr();
+        }
       } else {
         compileExpr();
       }
     }
 
-    if (insts.length === 0 || (insts[insts.length - 1].op !== OP.RETURN0 && insts[insts.length - 1].op !== OP.RETURN1)) {
+    compileStatementsUntil(stopAtEnd ? new Set(['end']) : new Set());
+    if (stopAtEnd) expect('end');
+
+    if (
+      insts.length === 0 ||
+      (insts[insts.length - 1].op !== OP.RETURN0 && insts[insts.length - 1].op !== OP.RETURN1)
+    ) {
       emit({ op: OP.RETURN0, A: 0, modeA: 0, B: 0, modeB: 0, C: 0, modeC: 0, line: 1 });
     }
 
     protos.push({ maxStack: maxStack + 4, numParams: params.length, upvals: [], insts });
-    return protos.length; // 1-based prototype index
+    return protos.length;
   }
 
   const entryIdx = compileBlock([], false);
@@ -706,11 +1048,31 @@ export function compileLuaToChunk(luaSource) {
 // =============================================================================
 // 6. Reconstructed VM Runtime in JS (รัน Bytecode เพื่อทดสอบเทียบผลลัพธ์)
 // =============================================================================
+function luaTruthy(v) {
+  return v !== false && v !== undefined && v !== null;
+}
+
+function luaLength(v) {
+  if (typeof v === 'string') return v.length;
+  if (v && typeof v === 'object') {
+    let n = 0;
+    while (Object.prototype.hasOwnProperty.call(v, n + 1) && v[n + 1] !== undefined) {
+      n++;
+    }
+    return n;
+  }
+  return 0;
+}
+
+function luaMod(a, b) {
+  return a - Math.floor(a / b) * b;
+}
+
 export function executeChunk(chunk, envOverrides = {}) {
   const logs = [];
   const env = {
     print: (...args) => {
-      const line = args.map((v) => String(v)).join('\t');
+      const line = args.map((v) => (v === undefined ? 'nil' : String(v))).join('\t');
       logs.push(line);
     },
     ...envOverrides,
@@ -720,10 +1082,14 @@ export function executeChunk(chunk, envOverrides = {}) {
     return function (...args) {
       const reg = {};
       let pc = 1;
-      let loopIter = 0, loopLimit = 0, loopStep = 0;
+      let loopIter = 0;
+      let loopLimit = 0;
+      let loopStep = 0;
       const loopStack = [];
+      let steps = 0;
 
       while (pc <= proto.insts.length) {
+        if (++steps > 100000) throw new Error('VM step limit exceeded');
         const inst = proto.insts[pc - 1];
         switch (inst.op) {
           case OP.NOP:
@@ -734,8 +1100,14 @@ export function executeChunk(chunk, envOverrides = {}) {
           case OP.JMP:
             pc = inst.B;
             break;
+          case OP.NEWTABLE:
+            reg[inst.B] = {};
+            break;
           case OP.GETGLOBAL:
             reg[inst.B] = env[inst.Ak];
+            break;
+          case OP.LEN:
+            reg[inst.B] = luaLength(reg[inst.C]);
             break;
           case OP.SUB:
             reg[inst.C] = reg[inst.B] - reg[inst.A];
@@ -749,6 +1121,9 @@ export function executeChunk(chunk, envOverrides = {}) {
             if (inst.A >= 2) reg[base] = ret;
             break;
           }
+          case OP.GETTABLE:
+            reg[inst.A] = reg[inst.B][reg[inst.C]];
+            break;
           case OP.FORPREP: {
             loopStack.push({ loopIter, loopLimit, loopStep });
             loopStep = Number(reg[inst.A + 2]);
@@ -757,11 +1132,17 @@ export function executeChunk(chunk, envOverrides = {}) {
             pc = inst.C;
             break;
           }
+          case OP.GETTABLE_K:
+            reg[inst.A] = reg[inst.C][inst.Bk];
+            break;
           case OP.LOADK:
             reg[inst.A] = inst.Ck;
             break;
           case OP.CONCAT:
             reg[inst.C] = String(reg[inst.B]) + String(reg[inst.A]);
+            break;
+          case OP.MOD:
+            reg[inst.A] = luaMod(Number(reg[inst.B]), Number(reg[inst.C]));
             break;
           case OP.FORLOOP: {
             loopIter += loopStep;
@@ -775,8 +1156,20 @@ export function executeChunk(chunk, envOverrides = {}) {
           case OP.MOVE:
             reg[inst.A] = reg[inst.C];
             break;
+          case OP.TEST_FALSE:
+            if (!luaTruthy(reg[inst.B])) pc = inst.C;
+            break;
           case OP.RETURN0:
             return undefined;
+          case OP.LT:
+            reg[inst.A] = reg[inst.B] < reg[inst.C];
+            break;
+          case OP.POW:
+            reg[inst.A] = Math.pow(Number(reg[inst.C]), Number(reg[inst.B]));
+            break;
+          case OP.NOT:
+            reg[inst.A] = !luaTruthy(reg[inst.B]);
+            break;
           case OP.SETGLOBAL:
             env[inst.Ck] = reg[inst.A];
             break;
@@ -785,14 +1178,32 @@ export function executeChunk(chunk, envOverrides = {}) {
             break;
           case OP.RETURN1:
             return reg[inst.B];
+          case OP.UNM:
+            reg[inst.B] = -Number(reg[inst.A]);
+            break;
+          case OP.DIV:
+            reg[inst.A] = Number(reg[inst.C]) / Number(reg[inst.B]);
+            break;
+          case OP.LOADNIL:
+            reg[inst.A] = undefined;
+            break;
+          case OP.SETTABLE_KR:
+            reg[inst.A][inst.Bk] = reg[inst.C];
+            break;
           case OP.LOADARGS:
             for (let i = 1; i <= inst.B; i++) reg[i] = args[i - 1];
+            break;
+          case OP.LE:
+            reg[inst.A] = reg[inst.B] <= reg[inst.C];
             break;
           case OP.EQ:
             reg[inst.C] = reg[inst.B] === reg[inst.A];
             break;
           case OP.CLOSURE:
             reg[inst.A] = wrapProto(inst.Bk);
+            break;
+          case OP.SETTABLE:
+            reg[inst.C][reg[inst.A]] = reg[inst.B];
             break;
           case OP.LOOP_POP: {
             const prev = loopStack.pop();
@@ -816,14 +1227,8 @@ export function executeChunk(chunk, envOverrides = {}) {
 }
 
 // =============================================================================
-// 7. Luraph v14.3-Style Obfuscated Lua Emitter (จำลองชั้น Obfuscation ให้เหมือนต้นฉบับ)
-//    - Wrapper Argument Injection (ส่ง stdlib, bit32 table C, key table L)
-//    - Control-Flow Flattening (CFF) ด้วยลูป while true + state p + memoized R + bit32
-//    - Number & String Literal Obfuscation (0X..., 0B..., underscores, \ddd, \xHH, \u{}, \z)
-//    - Ascii85 ("LPH-...") + Biased LEB128 + Deferred Constant Patching (I[2], I[3])
-//    - 7-Level Balanced Binary-Search if/else VM Opcode Dispatch Tree (0..103)
+// 7. Luraph v14.3-Style Obfuscated Lua Emitter (104-Opcode Tree + CFF + Bit32)
 // =============================================================================
-
 function createRng(seed = 0x143a7) {
   let s = seed >>> 0;
   return () => {
@@ -865,7 +1270,6 @@ function makeObfNum(rng, dialect = 'luau') {
       }
       return String(n);
     }
-    // Standard Lua 5.3 / 5.4 dialect (no 0b binary or underscores)
     if (pick < 0.65) {
       const prefix = rng() < 0.5 ? '0X' : '0x';
       return `${prefix}${n.toString(16).toUpperCase()}`;
@@ -884,7 +1288,7 @@ function makeObfStr(rng) {
         out += `\\${String(code).padStart(3, '0')}`;
       } else if (r < 0.56) {
         out += `\\x${code.toString(16).padStart(2, '0').toUpperCase()}`;
-      } else if (r < 0.80) {
+      } else if (r < 0.8) {
         const pad = rng() < 0.5 ? '00' : '';
         out += `\\u{${pad}${code.toString(16)}}`;
       } else {
@@ -900,7 +1304,6 @@ function makeObfStr(rng) {
 }
 
 function buildCFFBlock(steps, L, rng, obfNum, usedMemoKeys, cffChecks) {
-  // สร้าง state IDs ที่ไม่ซ้ำกัน
   const states = [];
   const used = new Set();
   for (let i = 0; i < steps.length; i++) {
@@ -921,7 +1324,6 @@ function buildCFFBlock(steps, L, rng, obfNum, usedMemoKeys, cffChecks) {
     return k;
   };
 
-  // สุ่มลำดับ branch ใน while true (control-flow flattening)
   const order = steps.map((_, idx) => idx);
   for (let i = order.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
@@ -952,7 +1354,6 @@ function buildCFFBlock(steps, L, rng, obfNum, usedMemoKeys, cffChecks) {
     return { curState, code: `${steps[stepIdx]};${transition}` };
   });
 
-  // ประกอบเป็น if / elseif tree ภายใน while true
   let body = '';
   for (let i = 0; i < branches.length; i++) {
     const b = branches[i];
@@ -965,15 +1366,13 @@ function buildCFFBlock(steps, L, rng, obfNum, usedMemoKeys, cffChecks) {
   return `p=${obfNum(states[0])};while true do ${body}end;`;
 }
 
-function buildOpcodeHandlers(obfNum) {
+function buildFull104OpcodeHandlers(obfNum) {
   const N0 = obfNum(0);
   const N1 = obfNum(1);
   const N2 = obfNum(2);
   const N3 = obfNum(3);
 
-  // ครบทั้ง 20 active opcodes + self-modifying aliases (6->17, 36->87, 45->4, 89->35)
-  // + VM introspection + standard Lua opcodes บนช่วง 0..103
-  return {
+  const core = {
     0: '',
     2: `(GO)[h[EO]]=(GO[l[EO]]+GO[PO[EO]]);`,
     4: `(GO)[PO[EO]]=(N);`,
@@ -1010,6 +1409,7 @@ function buildOpcodeHandlers(obfNum) {
     51: `if not GO[l[EO]]then EO=(h[EO]);end;`,
     52: `(GO)[l[EO]]=(sO[PO[EO]]);`,
     57: `return;`,
+    58: `(GO)[PO[EO]]=(GO[l[EO]]<GO[h[EO]]);`,
     59: `(GO)[PO[EO]]=(GO[h[EO]]^GO[l[EO]]);`,
     60: `(GO)[PO[EO]]=(GO[l[EO]]-t[EO]);`,
     61: `(GO)[PO[EO]]=(not GO[l[EO]]);`,
@@ -1042,36 +1442,33 @@ function buildOpcodeHandlers(obfNum) {
     101: `(GO)[PO[EO]]=(PO);`,
     102: `(GO)[l[EO]]=(GO[PO[EO]]*GO[h[EO]]);`,
   };
+
+  // เติมทุกช่องที่เหลือใน 0..103 ให้ครบ 104 opcodes (7-level tree เหมือน Luraph v14.3)
+  const full = {};
+  for (let op = 0; op < 104; op++) {
+    full[op] = core[op] !== undefined ? core[op] : '';
+  }
+  return full;
 }
 
 function buildBinarySearchDispatch(sortedOps, handlers, rng, obfNum) {
   if (sortedOps.length === 0) return '';
-  if (sortedOps.length === 1) {
-    return handlers[sortedOps[0]] || '';
-  }
+  if (sortedOps.length === 1) return handlers[sortedOps[0]] || '';
   if (sortedOps.length === 2) {
     const [opA, opB] = sortedOps;
     const hA = handlers[opA] || '';
     const hB = handlers[opB] || '';
-    if (rng() < 0.5) {
-      return `if a==${obfNum(opA)} then ${hA}else ${hB}end;`;
-    }
+    if (rng() < 0.5) return `if a==${obfNum(opA)} then ${hA}else ${hB}end;`;
     return `if a~=${obfNum(opB)} then ${hA}else ${hB}end;`;
   }
   const midIdx = Math.floor(sortedOps.length / 2);
   const pivot = sortedOps[midIdx];
-  const leftOps = sortedOps.slice(0, midIdx);
-  const rightOps = sortedOps.slice(midIdx);
-  const leftCode = buildBinarySearchDispatch(leftOps, handlers, rng, obfNum);
-  const rightCode = buildBinarySearchDispatch(rightOps, handlers, rng, obfNum);
+  const leftCode = buildBinarySearchDispatch(sortedOps.slice(0, midIdx), handlers, rng, obfNum);
+  const rightCode = buildBinarySearchDispatch(sortedOps.slice(midIdx), handlers, rng, obfNum);
 
   const style = rng();
-  if (style < 0.34) {
-    return `if a<${obfNum(pivot)} then ${leftCode}else ${rightCode}end;`;
-  }
-  if (style < 0.67) {
-    return `if not(a>=${obfNum(pivot)})then ${leftCode}else ${rightCode}end;`;
-  }
+  if (style < 0.34) return `if a<${obfNum(pivot)} then ${leftCode}else ${rightCode}end;`;
+  if (style < 0.67) return `if not(a>=${obfNum(pivot)})then ${leftCode}else ${rightCode}end;`;
   return `if a<=${obfNum(pivot - 1)} then ${leftCode}else ${rightCode}end;`;
 }
 
@@ -1164,32 +1561,47 @@ return (function(PAYLOAD, XOR_KEY, CONST_BIAS, PROTO_BIAS, INST_BIAS)
         local op = pr.O[pc]
         if op == 2 then R[pr.C[pc]] = R[pr.B[pc]] + R[pr.A[pc]]
         elseif op == 5 then pc = pr.B[pc]
+        elseif op == 11 then R[pr.B[pc]] = {}
         elseif op == 12 then R[pr.B[pc]] = env[pr.Ak[pc]]
+        elseif op == 14 then R[pr.B[pc]] = #R[pr.C[pc]]
         elseif op == 17 then R[pr.C[pc]] = R[pr.B[pc]] - R[pr.A[pc]]
         elseif op == 20 then
           local base, nA = pr.B[pc], pr.C[pc] - 1
           local ca = {}; for i = 1, nA do ca[i] = R[base + i] end
           local res = R[base]((table.unpack or unpack)(ca, 1, nA))
           if pr.A[pc] >= 2 then R[base] = res end
+        elseif op == 23 then R[pr.A[pc]] = R[pr.B[pc]][R[pr.C[pc]]]
         elseif op == 25 then
           st[#st+1] = {lIt, lLim, lStep}
           lStep, lLim = R[pr.A[pc]+2], R[pr.A[pc]+1]
           lIt = R[pr.A[pc]] - lStep; pc = pr.C[pc]
+        elseif op == 32 then R[pr.A[pc]] = R[pr.C[pc]][pr.Bk[pc]]
         elseif op == 34 then R[pr.A[pc]] = pr.Ck[pc]
         elseif op == 42 then R[pr.C[pc]] = tostring(R[pr.B[pc]]) .. tostring(R[pr.A[pc]])
+        elseif op == 44 then R[pr.A[pc]] = R[pr.B[pc]] % R[pr.C[pc]]
         elseif op == 46 then
           lIt = lIt + lStep
           if (lStep <= 0 and lIt >= lLim) or (lStep > 0 and lIt <= lLim) then
             R[pr.B[pc]+3] = lIt; pc = pr.C[pc]
           end
         elseif op == 47 then R[pr.A[pc]] = R[pr.C[pc]]
+        elseif op == 51 then if not R[pr.B[pc]] then pc = pr.C[pc] end
         elseif op == 57 then return
+        elseif op == 58 then R[pr.A[pc]] = (R[pr.B[pc]] < R[pr.C[pc]])
+        elseif op == 59 then R[pr.A[pc]] = R[pr.C[pc]] ^ R[pr.B[pc]]
+        elseif op == 61 then R[pr.A[pc]] = not R[pr.B[pc]]
         elseif op == 64 then env[pr.Ck[pc]] = R[pr.A[pc]]
         elseif op == 68 then R[pr.A[pc]] = R[pr.B[pc]] + pr.Ck[pc]
         elseif op == 69 then return R[pr.B[pc]]
+        elseif op == 75 then R[pr.B[pc]] = -R[pr.A[pc]]
+        elseif op == 81 then R[pr.A[pc]] = R[pr.C[pc]] / R[pr.B[pc]]
+        elseif op == 82 then R[pr.A[pc]] = nil
+        elseif op == 85 then R[pr.A[pc]][pr.Bk[pc]] = R[pr.C[pc]]
         elseif op == 86 then for i = 1, pr.B[pc] do R[i] = args[i] end
+        elseif op == 87 then R[pr.A[pc]] = (R[pr.B[pc]] <= R[pr.C[pc]])
         elseif op == 88 then R[pr.C[pc]] = (R[pr.B[pc]] == R[pr.A[pc]])
         elseif op == 90 then R[pr.A[pc]] = wrap(pr.Bk[pc])
+        elseif op == 94 then R[pr.C[pc]][R[pr.A[pc]]] = R[pr.B[pc]]
         elseif op == 99 then local s = table.remove(st); lIt, lLim, lStep = s[1], s[2], s[3]
         elseif op == 102 then R[pr.B[pc]] = R[pr.A[pc]] * R[pr.C[pc]]
         end
@@ -1200,26 +1612,22 @@ return (function(PAYLOAD, XOR_KEY, CONST_BIAS, PROTO_BIAS, INST_BIAS)
   return wrap(entry)(...)
 end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CONSTANTS.PROTO_COUNT_BIAS}, ${FORMAT_CONSTANTS.INST_COUNT_BIAS})
 `;
-    return returnMeta ? { code, cffChecks: [], opcodeCount: 20, keyTableL: [] } : code;
+    return returnMeta ? { code, cffChecks: [], opcodeCount: Object.keys(OP).length, keyTableL: [] } : code;
   }
 
-  // ---- Luraph v14.3-Style Obfuscated Emitter ----
+  // ---- Luraph v14.3-Style Obfuscated Emitter (104-Opcode 7-Level Tree) ----
   const rng = createRng(seed);
   const obfNum = makeObfNum(rng, dialect);
   const obfStr = makeObfStr(rng);
   const usedMemoKeys = new Set();
   const cffChecks = [];
 
-  // Key table L (9 32-bit constants คล้าย L ใน loader.lua_5e4ba8d7.txt)
   const L = Array.from({ length: 9 }, () => Math.floor(rng() * 0x7fffffff) + 1024);
 
-  const handlers = buildOpcodeHandlers(obfNum);
-  const sortedOps = Object.keys(handlers)
-    .map(Number)
-    .sort((a, b) => a - b);
+  const handlers = buildFull104OpcodeHandlers(obfNum);
+  const sortedOps = Array.from({ length: 104 }, (_, i) => i);
   const dispatchTree = buildBinarySearchDispatch(sortedOps, handlers, rng, obfNum);
 
-  // CFF Block 1: Bootstrapper & Ascii85 Decoder + Binary Stream Readers
   const cffBootstrap = buildCFFBlock(
     [
       `z=C.m;E=C.A;WO=C.t;I={};R={}`,
@@ -1236,7 +1644,6 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
     cffChecks
   );
 
-  // Prototype Deserializer s() (ตรงกับ slot mapping qO[1..11] ของ loader.lua)
   const protoDeserializer =
     `sO_fn=function()` +
     `local qO={Q,Q,Q,Q,Q,Q,Q,Q,Q,Q,Q};local LO={};qO[${obfNum(10)}]=LO;local lP=${obfNum(1)};` +
@@ -1259,7 +1666,6 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
     `elseif m3==b then local n=#v;v[n+DO]=Pr;v[n+${obfNum(2)}]=idx;v[n+${obfNum(3)}]=v3;end;` +
     `end;return qO;end;`;
 
-  // CFF Block 2: Chunk Deserializer FO()
   const cffDeserialize = buildCFFBlock(
     [
       `nK=e()-${obfNum(FORMAT_CONSTANTS.CONST_COUNT_BIAS)};_O=WO(nK);rO=(VO()~=kO)`,
@@ -1274,7 +1680,6 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
     cffChecks
   );
 
-  // VM Interpreter y(nO, sO) พร้อม 7-level balanced binary search dispatch tree
   const vmClosure =
     `y=function(nO,sO)` +
     `local qS=nO[${obfNum(4)}];` +
@@ -1284,7 +1689,6 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
     `while EO<=#N do local a=(N[EO]);${dispatchTree}EO=EO+DO;end;` +
     `end);end;`;
 
-  // CFF Block 3: Stage-1-Style Deferred Constant Decryption & Final Launch
   const cffLaunch = buildCFFBlock(
     [
       `k=FO()`,
@@ -1300,7 +1704,6 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
     cffChecks
   );
 
-  // Bit32 / table.create fallback expression inside injected C table (ทำงานได้ทั้ง Luau และ Lua 5.3/5.4)
   const cTableExpr =
     dialect === 'luau'
       ? `{g=bit32.rrotate,A=string.unpack,l=bit32.bnot,j=bit32.countrz,x=bit32.band,D=setmetatable,f=bit32.lrotate,i=string.pack,u=bit32.lshift,a=bit32.bor,m=string.byte,r=bit32.countlz,q=bit32.rshift,J=string.char,s=bit32.bxor,t=table.create}`
@@ -1364,8 +1767,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   console.log(`  Constants : ${chunk.consts.length}`);
   console.log(`  Prototypes: ${chunk.protos.length} (entry=#${chunk.entryIdx})`);
   console.log(`  Binary    : ${binary.length} bytes -> Ascii85 ${ascii85.length} chars`);
-  console.log(`  VM Tree   : ${opcodeCount} opcodes (balanced binary-search dispatch)`);
+  console.log(`  VM Tree   : ${opcodeCount} opcodes (7-level balanced binary-search dispatch)`);
   console.log(`  CFF States: ${cffChecks.length} memoized bit32 transitions`);
   console.log(`  XOR Key   : 0x${xorKey.toString(16).toUpperCase()} (deferred=${xorKey !== 0})`);
 }
-

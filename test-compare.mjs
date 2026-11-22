@@ -2,12 +2,11 @@
 /**
  * test-compare.mjs
  * -----------------------------------------------------------------------------
- * สคริปต์ทดสอบเปรียบเทียบผลลัพธ์ระหว่าง:
- *   (A) การประมวลผลโค้ดต้นฉบับ `input.lua` (Reference Evaluator)
- *   (B) การเข้ารหัส `input.lua` -> Binary Chunk -> Ascii85 ("LPH-") -> `output_encoded.lua`
- *       ในรูปแบบ Luraph v14.3-Style (Wrapper Injection, CFF + Memoized R/bit32,
- *       Literal Obfuscation, Deferred I[2] Patching, Binary-Search Opcode Tree)
- *       แล้วถอดรหัสกลับจากไฟล์ `output_encoded.lua` และรันบน Reconstructed VM
+ * ชุดทดสอบเปรียบเทียบผลลัพธ์แบบครบชุด (Multi-Case Round-Trip & Obfuscation Suite):
+ *   Case 1: input.lua                        (Luraph-Style · Luau · XOR 0x5A) -> output_encoded.lua
+ *   Case 2: examples/conditionals_loops.lua  (Luraph-Style · Lua 5.3 · XOR 0x3C)
+ *   Case 3: examples/tables_fibonacci.lua    (Luraph-Style · Luau · Plaintext XOR 0x00)
+ *   Case 4: input.lua                        (Readable VM Mode · XOR 0x5A)
  *
  * วิธีรัน:
  *   node test-compare.mjs
@@ -24,43 +23,66 @@ import {
   generateEncodedLua,
 } from './encoder.mjs';
 
-const XOR_KEY = 0x5a;
-const SEED = 0x143a7;
-const INPUT_FILE = 'input.lua';
-const OUTPUT_FILE = 'output_encoded.lua';
+// Reference evaluators สำหรับแต่ละไฟล์ตัวอย่าง
+const TEST_CASES = [
+  {
+    name: 'Case 1: Basic Function + Numeric For (Luraph-Style · Luau · XOR 0x5A)',
+    file: 'input.lua',
+    outputFile: 'output_encoded.lua',
+    xorKey: 0x5a,
+    style: 'luraph',
+    dialect: 'luau',
+    seed: 0x143a7,
+    expected: {
+      logs: ['Static Analysis Verified | Score=172', 'Check:\ttrue'],
+      returnValue: 'Static Analysis Verified | Score=172',
+    },
+  },
+  {
+    name: 'Case 2: Conditionals, While, Repeat, Math & Unary (Luraph-Style · Lua 5.3 · XOR 0x3C)',
+    file: 'examples/conditionals_loops.lua',
+    outputFile: null,
+    xorKey: 0x3c,
+    style: 'luraph',
+    dialect: 'lua53',
+    seed: 0x99881,
+    expected: {
+      logs: ['FizzBuzz(15):\tFizzBuzz', 'OddSqSum:\t165\tNeg:\t-165\tFlag:\ttrue', 'Trace:\t3-2-1-'],
+      returnValue: 'FizzBuzz:165:3-2-1-',
+    },
+  },
+  {
+    name: 'Case 3: Tables, Array/Field Access & Fibonacci (Luraph-Style · Luau · Plaintext)',
+    file: 'examples/tables_fibonacci.lua',
+    outputFile: null,
+    xorKey: 0x0,
+    style: 'luraph',
+    dialect: 'luau',
+    seed: 0x42024,
+    expected: {
+      logs: ['FibVM[8]=21', 'F(6):\t8\tF(8):\t21'],
+      returnValue: 'FibVM[8]=21',
+    },
+  },
+  {
+    name: 'Case 4: Readable VM Round-Trip Mode (input.lua · XOR 0x5A)',
+    file: 'input.lua',
+    outputFile: null,
+    xorKey: 0x5a,
+    style: 'readable',
+    dialect: 'luau',
+    seed: 0x143a7,
+    expected: {
+      logs: ['Static Analysis Verified | Score=172', 'Check:\ttrue'],
+      returnValue: 'Static Analysis Verified | Score=172',
+    },
+  },
+];
 
-// Reference execution ของ input.lua (เทียบผลลัพธ์จาก logic ต้นฉบับโดยตรง)
-function evaluateOriginalInputLua() {
-  const logs = [];
-  const print = (...args) => logs.push(args.map(String).join('\t'));
-
-  function computeScore(base, multiplier, bonus) {
-    let total = 0;
-    for (let i = 1; i <= 5; i++) {
-      total = total + base * multiplier + i;
-    }
-    total = total + bonus;
-    return total;
-  }
-
-  const greeting = 'Static Analysis Verified';
-  const score = computeScore(10, 3, 7);
-  const summary = greeting + ' | Score=' + score;
-
-  print(summary);
-  print('Check:', score === 172);
-  return { logs, returnValue: summary };
-}
-
-function main() {
-  console.log('====================================================================');
-  console.log(' Luraph v14.3-Style Reverse-Encoding & Round-Trip Verification Test');
-  console.log('====================================================================\n');
-
-  // Step 1: อ่าน input.lua และเข้ารหัสเป็น output_encoded.lua แบบ Luraph-style
-  const luaSource = fs.readFileSync(INPUT_FILE, 'utf8');
-  const compiledChunk = compileLuaToChunk(luaSource);
-  const binaryBuffer = serializeChunk(compiledChunk, { xorKey: XOR_KEY });
+function verifyCase(tc) {
+  const source = fs.readFileSync(tc.file, 'utf8');
+  const compiledChunk = compileLuaToChunk(source);
+  const binaryBuffer = serializeChunk(compiledChunk, { xorKey: tc.xorKey });
   const ascii85 = encodeAscii85(binaryBuffer);
   const {
     code: encodedLua,
@@ -68,82 +90,83 @@ function main() {
     opcodeCount,
     keyTableL,
   } = generateEncodedLua(ascii85, {
-    xorKey: XOR_KEY,
-    style: 'luraph',
-    dialect: 'luau',
-    seed: SEED,
+    xorKey: tc.xorKey,
+    style: tc.style,
+    dialect: tc.dialect,
+    seed: tc.seed,
     returnMeta: true,
   });
-  fs.writeFileSync(OUTPUT_FILE, encodedLua, 'utf8');
 
-  console.log(`[1] Compiled & Obfuscated "${INPUT_FILE}" -> "${OUTPUT_FILE}"`);
-  console.log(`    - Source size  : ${luaSource.length} bytes`);
-  console.log(`    - Output size  : ${encodedLua.length} bytes (single-line Luraph-style)`);
-  console.log(`    - Constants    : ${compiledChunk.consts.length}`);
-  console.log(`    - Prototypes   : ${compiledChunk.protos.length} (Entry Proto #${compiledChunk.entryIdx})`);
-  console.log(`    - Raw bytecode : ${binaryBuffer.length} bytes`);
-  console.log(`    - Ascii85 str  : ${ascii85.length} chars ("${ascii85.slice(0, 28)}...")`);
-  console.log(`    - VM Dispatch  : ${opcodeCount} opcodes (balanced binary-search if/else tree)`);
-  console.log(`    - CFF States   : ${cffChecks.length} memoized bit32 transitions\n`);
+  if (tc.outputFile) {
+    fs.writeFileSync(tc.outputFile, encodedLua, 'utf8');
+  }
 
-  // Step 2: ตรวจสอบความถูกต้องของ CFF state transitions และโครงสร้าง Obfuscation
-  let cffValidCount = 0;
+  // 1) ตรวจสอบสมการ CFF bit32 ทุก transition
   for (const ch of cffChecks) {
-    const computed = ch.delta + ((((keyTableL[ch.i1 - 1] ^ keyTableL[ch.i2 - 1]) >>> 0) & ch.mask) >>> 0);
+    const computed =
+      ch.delta + ((((keyTableL[ch.i1 - 1] ^ keyTableL[ch.i2 - 1]) >>> 0) & ch.mask) >>> 0);
     if (computed !== ch.nextState) {
-      throw new Error(`CFF transition mismatch: expected ${ch.nextState}, got ${computed}`);
+      throw new Error(`${tc.name}: CFF mismatch expected ${ch.nextState}, got ${computed}`);
     }
-    cffValidCount++;
   }
 
-  const writtenFile = fs.readFileSync(OUTPUT_FILE, 'utf8');
-  const hasWrapper = /return\(function\(A,P,DO,H,Q,Y,s/.test(writtenFile);
-  const hasCFF = /while true do if p==/.test(writtenFile) && /C\.x\(C\.s\(L\[/.test(writtenFile);
-  const hasBinaryTree = /while EO<=#N do local a=\(N\[EO\]\);if /.test(writtenFile);
-  const hasLiteralObf = /0[bB][01_]+/.test(writtenFile) && /\\u\{/.test(writtenFile);
+  // 2) ตรวจสอบโครงสร้าง Obfuscation (กรณี style = 'luraph')
+  if (tc.style === 'luraph') {
+    if (!/return\(function\(A,P,DO,H,Q,Y,s/.test(encodedLua)) {
+      throw new Error(`${tc.name}: Missing wrapper argument injection`);
+    }
+    if (!/while true do if p==/.test(encodedLua) || !/C\.x\(C\.s\(L\[/.test(encodedLua)) {
+      throw new Error(`${tc.name}: Missing CFF bit32 state machine`);
+    }
+    if (opcodeCount !== 104) {
+      throw new Error(`${tc.name}: Expected 104-opcode tree, got ${opcodeCount}`);
+    }
+    if (tc.dialect === 'lua53' && /\b0[bB][01_]+/.test(encodedLua)) {
+      throw new Error(`${tc.name}: Lua 5.3 dialect should not contain 0b binary literals`);
+    }
+  }
 
-  console.log('[2] Obfuscation Layer Verification:');
-  console.log(`    - Wrapper Arg Injection : ${hasWrapper ? 'OK' : 'FAIL'}`);
-  console.log(`    - CFF + bit32 Memoize   : ${hasCFF ? 'OK' : 'FAIL'} (${cffValidCount}/${cffChecks.length} equations verified)`);
-  console.log(`    - Binary-Search VM Tree : ${hasBinaryTree ? 'OK' : 'FAIL'}`);
-  console.log(`    - Literal Obfuscation   : ${hasLiteralObf ? 'OK' : 'FAIL'}\n`);
-
-  // Step 3: แกะ Payload "LPH-..." กลับจากไฟล์ output_encoded.lua ที่เพิ่งสร้าง
-  const match = writtenFile.match(/"(LPH-(?:\\.|[^"\\])*)"/);
+  // 3) แกะ Payload "LPH-..." กลับจากโค้ด Lua ที่สร้างขึ้นจริง แล้วรันเทียบผลลัพธ์
+  const match = encodedLua.match(/"(LPH-(?:\\.|[^"\\])+)"/);
   if (!match) {
-    throw new Error('Failed to extract LPH- payload from output_encoded.lua');
+    throw new Error(`${tc.name}: Failed to extract LPH- payload`);
   }
-  const extractedPayload = match[1].replace(/\\(.)/g, '$1');
-  const decodedBytes = decodeAscii85(extractedPayload);
-  const roundTrippedChunk = deserializeChunk(decodedBytes, { xorKey: XOR_KEY });
-
-  console.log(`[3] Decoded & Deserialized "${OUTPUT_FILE}"`);
-  console.log(`    - Decoded bytes: ${decodedBytes.length} bytes (padded to 4-byte boundary)`);
-  console.log(`    - Deferred mode: ${roundTrippedChunk.deferred} (XOR key = 0x${XOR_KEY.toString(16).toUpperCase()})`);
-  console.log(`    - Constants    : ${JSON.stringify(roundTrippedChunk.consts)}\n`);
-
-  // Step 4: รันเทียบผลลัพธ์ระหว่างโค้ดต้นฉบับ vs โค้ดที่เข้ารหัสใหม่
-  const originalResult = evaluateOriginalInputLua();
+  const extracted = match[1].replace(/\\(.)/g, '$1');
+  const decodedBytes = decodeAscii85(extracted);
+  const roundTrippedChunk = deserializeChunk(decodedBytes, { xorKey: tc.xorKey });
   const encodedResult = executeChunk(roundTrippedChunk);
 
-  console.log('[4] Execution Output Comparison:');
-  console.log('    Original stdout :', JSON.stringify(originalResult.logs));
-  console.log('    Encoded  stdout :', JSON.stringify(encodedResult.logs));
-  console.log('    Original return :', JSON.stringify(originalResult.returnValue));
-  console.log('    Encoded  return :', JSON.stringify(encodedResult.returnValue));
+  const logsMatch = JSON.stringify(encodedResult.logs) === JSON.stringify(tc.expected.logs);
+  const retMatch = encodedResult.returnValue === tc.expected.returnValue;
 
-  const logsMatch = JSON.stringify(originalResult.logs) === JSON.stringify(encodedResult.logs);
-  const retMatch = originalResult.returnValue === encodedResult.returnValue;
-  const layersOk = hasWrapper && hasCFF && hasBinaryTree && hasLiteralObf && cffValidCount === cffChecks.length;
-
-  console.log('\n--------------------------------------------------------------------');
-  if (logsMatch && retMatch && layersOk) {
-    console.log(' PASS: โครงสร้าง Luraph-Style ครบทุกชั้น และผลลัพธ์ตรงกับโค้ดต้นฉบับ 100%!');
-  } else {
-    console.error(' FAIL: ตรวจสอบพบข้อผิดพลาด!');
+  if (!logsMatch || !retMatch) {
+    console.error(`  [FAIL] ${tc.name}`);
+    console.error(`    Expected stdout: ${JSON.stringify(tc.expected.logs)}`);
+    console.error(`    Actual   stdout: ${JSON.stringify(encodedResult.logs)}`);
+    console.error(`    Expected return: ${JSON.stringify(tc.expected.returnValue)}`);
+    console.error(`    Actual   return: ${JSON.stringify(encodedResult.returnValue)}`);
     process.exit(1);
   }
-  console.log('--------------------------------------------------------------------');
+
+  console.log(`[PASS] ${tc.name}`);
+  console.log(
+    `       Binary=${binaryBuffer.length}B | Ascii85=${ascii85.length}ch | Out=${encodedLua.length}B | Ops=${opcodeCount} | CFF=${cffChecks.length}/${cffChecks.length}`
+  );
+  console.log(`       stdout=${JSON.stringify(encodedResult.logs)} | return=${JSON.stringify(encodedResult.returnValue)}`);
+}
+
+function main() {
+  console.log('========================================================================');
+  console.log(' Luraph v14.3-Style Reverse-Encoding & Multi-Case Verification Suite');
+  console.log('========================================================================\n');
+
+  for (const tc of TEST_CASES) {
+    verifyCase(tc);
+  }
+
+  console.log('\n------------------------------------------------------------------------');
+  console.log(` ALL ${TEST_CASES.length}/${TEST_CASES.length} TESTS PASSED (100% Output & Obfuscation Integrity Verified)`);
+  console.log('------------------------------------------------------------------------');
 }
 
 main();

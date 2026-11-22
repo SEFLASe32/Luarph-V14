@@ -8,7 +8,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "encode": "node encoder.mjs input.lua output_encoded.lua",
+    "encode:lua53": "node encoder.mjs input.lua output_encoded.lua --dialect=lua53",
+    "encode:readable": "node encoder.mjs input.lua output_encoded.lua --readable",
+    "test:encoder": "node test-compare.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

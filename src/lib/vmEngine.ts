@@ -15,21 +15,36 @@ export const OP = {
   NOP: 0,
   ADD: 2,
   JMP: 5,
+  NEWTABLE: 11,
   GETGLOBAL: 12,
+  LEN: 14,
   SUB: 17,
   CALL: 20,
+  GETTABLE: 23,
   FORPREP: 25,
+  GETTABLE_K: 32,
   LOADK: 34,
   CONCAT: 42,
+  MOD: 44,
   FORLOOP: 46,
   MOVE: 47,
+  TEST_FALSE: 51,
   RETURN0: 57,
+  LT: 58,
+  POW: 59,
+  NOT: 61,
   SETGLOBAL: 64,
   ADDK: 68,
   RETURN1: 69,
+  UNM: 75,
+  DIV: 81,
+  LOADNIL: 82,
+  SETTABLE_KR: 85,
   LOADARGS: 86,
+  LE: 87,
   EQ: 88,
   CLOSURE: 90,
+  SETTABLE: 94,
   LOOP_POP: 99,
   MUL: 102,
 } as const;
@@ -266,7 +281,10 @@ export function serializeChunk(chunk: VMChunk, xorKey = 0): Uint8Array {
 export function deserializeChunk(buf: Uint8Array, xorKey = 0): VMChunk {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   let pos = 0;
-  const readByte = () => buf[pos++];
+  const readByte = () => {
+    if (pos >= buf.length) throw new Error('Unexpected EOF while deserializing chunk');
+    return buf[pos++];
+  };
   const readU32 = () => {
     const v = view.getUint32(pos, true);
     pos += 4;
@@ -402,6 +420,28 @@ interface Token {
   line: number;
 }
 
+const KEYWORDS = new Set([
+  'local',
+  'function',
+  'for',
+  'while',
+  'repeat',
+  'until',
+  'if',
+  'then',
+  'elseif',
+  'else',
+  'do',
+  'end',
+  'return',
+  'true',
+  'false',
+  'nil',
+  'not',
+  'and',
+  'or',
+]);
+
 export function compileLuaToChunk(luaSource: string): VMChunk {
   const consts: ConstantValue[] = [];
   const constMap = new Map<string, number>();
@@ -441,7 +481,10 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
         while (i < src.length && src[i] !== quote) {
           if (src[i] === '\\') {
             i++;
-            s += src[i] === 'n' ? '\n' : src[i];
+            if (src[i] === 'n') s += '\n';
+            else if (src[i] === 't') s += '\t';
+            else if (src[i] === 'r') s += '\r';
+            else s += src[i];
           } else {
             s += src[i];
           }
@@ -453,6 +496,13 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
       }
       if (/[0-9]/.test(ch)) {
         let num = '';
+        if (ch === '0' && (src[i + 1] === 'x' || src[i + 1] === 'X')) {
+          num = src.slice(i, i + 2);
+          i += 2;
+          while (i < src.length && /[0-9a-fA-F]/.test(src[i])) num += src[i++];
+          tokens.push({ type: 'NUM', val: Number.parseInt(num.slice(2), 16), line });
+          continue;
+        }
         while (i < src.length && /[0-9.]/.test(src[i])) num += src[i++];
         tokens.push({ type: 'NUM', val: Number(num), line });
         continue;
@@ -460,8 +510,7 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
       if (/[A-Za-z_]/.test(ch)) {
         let id = '';
         while (i < src.length && /[A-Za-z0-9_]/.test(src[i])) id += src[i++];
-        const kw = ['local', 'function', 'for', 'do', 'end', 'return', 'true', 'false'];
-        tokens.push({ type: kw.includes(id) ? 'KW' : 'ID', val: id, line });
+        tokens.push({ type: KEYWORDS.has(id) ? 'KW' : 'ID', val: id, line });
         continue;
       }
       const two = src.slice(i, i + 2);
@@ -523,26 +572,67 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
     };
 
     function compileExpr(targetReg?: number): number {
-      return compileCompare(targetReg);
+      return compileOr(targetReg);
+    }
+
+    function compileOr(targetReg?: number): number {
+      let left = compileAnd(targetReg);
+      while (peek().type === 'KW' && peek().val === 'or') {
+        const opTok = next();
+        const dest = targetReg ?? allocReg();
+        if (left !== dest) {
+          emit({ op: OP.MOVE, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        const notReg = allocReg();
+        emit({ op: OP.NOT, A: notReg, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: opTok.line });
+        const skipRhs = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: notReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: opTok.line });
+        compileAnd(dest);
+        insts[skipRhs - 1].C = insts.length;
+        left = dest;
+      }
+      return left;
+    }
+
+    function compileAnd(targetReg?: number): number {
+      let left = compileCompare(targetReg);
+      while (peek().type === 'KW' && peek().val === 'and') {
+        const opTok = next();
+        const dest = targetReg ?? allocReg();
+        if (left !== dest) {
+          emit({ op: OP.MOVE, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        const skipRhs = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: dest, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: opTok.line });
+        compileCompare(dest);
+        insts[skipRhs - 1].C = insts.length;
+        left = dest;
+      }
+      return left;
     }
 
     function compileCompare(targetReg?: number): number {
-      const left = compileConcat(targetReg);
-      while (peek().type === 'OP' && peek().val === '==') {
+      let left = compileConcat(targetReg);
+      while (
+        (peek().type === 'OP' && ['==', '~=', '<=', '>='].includes(String(peek().val))) ||
+        (peek().type === 'SYM' && (peek().val === '<' || peek().val === '>'))
+      ) {
         const opTok = next();
         const right = compileConcat(allocReg());
         const dest = targetReg ?? allocReg();
-        emit({
-          op: OP.EQ,
-          A: right,
-          modeA: MODE.REG,
-          B: left,
-          modeB: MODE.REG,
-          C: dest,
-          modeC: MODE.REG,
-          line: opTok.line,
-        });
-        return dest;
+        if (opTok.val === '==') {
+          emit({ op: OP.EQ, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '~=') {
+          emit({ op: OP.EQ, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
+          emit({ op: OP.NOT, A: dest, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: opTok.line });
+        } else if (opTok.val === '<') {
+          emit({ op: OP.LT, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '>') {
+          emit({ op: OP.LT, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '<=') {
+          emit({ op: OP.LE, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '>=') {
+          emit({ op: OP.LE, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        }
+        left = dest;
       }
       return left;
     }
@@ -553,26 +643,17 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
         const opTok = next();
         const right = compileAddSub(allocReg());
         const dest = targetReg ?? allocReg();
-        emit({
-          op: OP.CONCAT,
-          A: right,
-          modeA: MODE.REG,
-          B: left,
-          modeB: MODE.REG,
-          C: dest,
-          modeC: MODE.REG,
-          line: opTok.line,
-        });
+        emit({ op: OP.CONCAT, A: right, modeA: MODE.REG, B: left, modeB: MODE.REG, C: dest, modeC: MODE.REG, line: opTok.line });
         left = dest;
       }
       return left;
     }
 
     function compileAddSub(targetReg?: number): number {
-      let left = compileMul(targetReg);
+      let left = compileMulDivMod(targetReg);
       while (peek().type === 'SYM' && (peek().val === '+' || peek().val === '-')) {
         const opTok = next();
-        const right = compileMul(allocReg());
+        const right = compileMulDivMod(allocReg());
         const dest = targetReg ?? allocReg();
         emit({
           op: opTok.val === '+' ? OP.ADD : OP.SUB,
@@ -589,34 +670,154 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
       return left;
     }
 
-    function compileMul(targetReg?: number): number {
-      let left = compilePrimary(targetReg);
-      while (peek().type === 'SYM' && peek().val === '*') {
+    function compileMulDivMod(targetReg?: number): number {
+      let left = compileUnary(targetReg);
+      while (peek().type === 'SYM' && (peek().val === '*' || peek().val === '/' || peek().val === '%')) {
         const opTok = next();
-        const right = compilePrimary(allocReg());
+        const right = compileUnary(allocReg());
         const dest = targetReg ?? allocReg();
-        emit({
-          op: OP.MUL,
-          A: left,
-          modeA: MODE.REG,
-          B: dest,
-          modeB: MODE.REG,
-          C: right,
-          modeC: MODE.REG,
-          line: opTok.line,
-        });
+        if (opTok.val === '*') {
+          emit({ op: OP.MUL, A: left, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        } else if (opTok.val === '/') {
+          emit({ op: OP.DIV, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        } else {
+          emit({ op: OP.MOD, A: dest, modeA: MODE.REG, B: left, modeB: MODE.REG, C: right, modeC: MODE.REG, line: opTok.line });
+        }
         left = dest;
       }
       return left;
+    }
+
+    function compileUnary(targetReg?: number): number {
+      const t = peek();
+      if (t.type === 'SYM' && t.val === '-') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.UNM, A: operand, modeA: MODE.REG, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        return dest;
+      }
+      if (t.type === 'KW' && t.val === 'not') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.NOT, A: dest, modeA: MODE.REG, B: operand, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        return dest;
+      }
+      if (t.type === 'SYM' && t.val === '#') {
+        next();
+        const operand = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.LEN, A: 0, modeA: 0, B: dest, modeB: MODE.REG, C: operand, modeC: MODE.REG, line: t.line });
+        return dest;
+      }
+      return compilePow(targetReg);
+    }
+
+    function compilePow(targetReg?: number): number {
+      const left = compilePrimary(targetReg);
+      if (peek().type === 'SYM' && peek().val === '^') {
+        const opTok = next();
+        const right = compileUnary(allocReg());
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.POW, A: dest, modeA: MODE.REG, B: right, modeB: MODE.REG, C: left, modeC: MODE.REG, line: opTok.line });
+        return dest;
+      }
+      return left;
+    }
+
+    function compilePostfix(reg: number, targetReg: number | undefined, startLine: number): number {
+      let cur = reg;
+      while (true) {
+        if (peek().type === 'SYM' && peek().val === '.') {
+          next();
+          const fieldTok = next();
+          const kIdx = addConst(String(fieldTok.val));
+          const nextRegOut = allocReg();
+          emit({ op: OP.GETTABLE_K, A: nextRegOut, modeA: MODE.REG, B: kIdx, modeB: MODE.CONST, C: cur, modeC: MODE.REG, line: fieldTok.line });
+          cur = nextRegOut;
+        } else if (peek().type === 'SYM' && peek().val === '[') {
+          const lb = next();
+          const keyReg = compileExpr(allocReg());
+          expect(']');
+          const nextRegOut = allocReg();
+          emit({ op: OP.GETTABLE, A: nextRegOut, modeA: MODE.REG, B: cur, modeB: MODE.REG, C: keyReg, modeC: MODE.REG, line: lb.line });
+          cur = nextRegOut;
+        } else if (peek().type === 'SYM' && peek().val === '(') {
+          next();
+          const argRegs: number[] = [];
+          if (!(peek().type === 'SYM' && peek().val === ')')) {
+            while (true) {
+              argRegs.push(compileExpr(allocReg()));
+              if (peek().type === 'SYM' && peek().val === ',') next();
+              else break;
+            }
+          }
+          expect(')');
+          const callBase = allocReg();
+          emit({ op: OP.MOVE, A: callBase, modeA: MODE.REG, B: 0, modeB: 0, C: cur, modeC: MODE.REG, line: startLine });
+          for (let ai = 0; ai < argRegs.length; ai++) {
+            const slot = allocReg();
+            emit({ op: OP.MOVE, A: slot, modeA: MODE.REG, B: 0, modeB: 0, C: argRegs[ai], modeC: MODE.REG, line: startLine });
+          }
+          emit({ op: OP.CALL, A: 2, modeA: MODE.REG, B: callBase, modeB: MODE.REG, C: argRegs.length + 1, modeC: MODE.REG, line: startLine });
+          cur = callBase;
+        } else {
+          break;
+        }
+      }
+      if (targetReg !== undefined && targetReg !== cur) {
+        emit({ op: OP.MOVE, A: targetReg, modeA: MODE.REG, B: 0, modeB: 0, C: cur, modeC: MODE.REG, line: startLine });
+        return targetReg;
+      }
+      return cur;
     }
 
     function compilePrimary(targetReg?: number): number {
       const t = peek();
       if (t.type === 'SYM' && t.val === '(') {
         next();
-        const r = compileExpr(targetReg);
+        const r = compileExpr(allocReg());
         expect(')');
-        return r;
+        return compilePostfix(r, targetReg, t.line);
+      }
+      if (t.type === 'SYM' && t.val === '{') {
+        next();
+        const tblReg = targetReg ?? allocReg();
+        emit({ op: OP.NEWTABLE, A: 0, modeA: 0, B: tblReg, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        let arrIdx = 1;
+        while (!(peek().type === 'SYM' && peek().val === '}')) {
+          if (peek().type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
+            const kTok = next();
+            expect('=');
+            const valReg = compileExpr(allocReg());
+            const kIdx = addConst(String(kTok.val));
+            emit({ op: OP.SETTABLE_KR, A: tblReg, modeA: MODE.REG, B: kIdx, modeB: MODE.CONST, C: valReg, modeC: MODE.REG, line: kTok.line });
+          } else if (peek().type === 'SYM' && peek().val === '[') {
+            next();
+            const keyReg = compileExpr(allocReg());
+            expect(']');
+            expect('=');
+            const valReg = compileExpr(allocReg());
+            emit({ op: OP.SETTABLE, A: keyReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: tblReg, modeC: MODE.REG, line: t.line });
+          } else {
+            const valReg = compileExpr(allocReg());
+            const idxReg = allocReg();
+            const kIdx = addConst(arrIdx++);
+            emit({ op: OP.LOADK, A: idxReg, modeA: MODE.REG, B: 0, modeB: 0, C: kIdx, modeC: MODE.CONST, line: t.line });
+            emit({ op: OP.SETTABLE, A: idxReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: tblReg, modeC: MODE.REG, line: t.line });
+          }
+          if (peek().type === 'SYM' && (peek().val === ',' || peek().val === ';')) next();
+          else break;
+        }
+        expect('}');
+        return tblReg;
+      }
+      if (t.type === 'KW' && t.val === 'nil') {
+        next();
+        const dest = targetReg ?? allocReg();
+        emit({ op: OP.LOADNIL, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: 0, line: t.line });
+        return dest;
       }
       if (
         t.type === 'NUM' ||
@@ -627,16 +828,7 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
         const dest = targetReg ?? allocReg();
         const val: ConstantValue = t.type === 'KW' ? t.val === 'true' : t.val;
         const kIdx = addConst(val);
-        emit({
-          op: OP.LOADK,
-          A: dest,
-          modeA: MODE.REG,
-          B: 0,
-          modeB: 0,
-          C: kIdx,
-          modeC: MODE.CONST,
-          line: t.line,
-        });
+        emit({ op: OP.LOADK, A: dest, modeA: MODE.REG, B: 0, modeB: 0, C: kIdx, modeC: MODE.CONST, line: t.line });
         return dest;
       }
       if (t.type === 'ID') {
@@ -644,123 +836,26 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
         const idName = String(t.val);
         let reg: number;
         if (locals.has(idName)) {
-          const src = locals.get(idName)!;
-          if (targetReg !== undefined && targetReg !== src) {
-            emit({
-              op: OP.MOVE,
-              A: targetReg,
-              modeA: MODE.REG,
-              B: 0,
-              modeB: 0,
-              C: src,
-              modeC: MODE.REG,
-              line: t.line,
-            });
-            reg = targetReg;
-          } else {
-            reg = src;
-          }
+          reg = locals.get(idName)!;
         } else {
-          const dest = targetReg ?? allocReg();
+          const dest = allocReg();
           const kIdx = addConst(idName);
-          emit({
-            op: OP.GETGLOBAL,
-            A: kIdx,
-            modeA: MODE.CONST,
-            B: dest,
-            modeB: MODE.REG,
-            C: 0,
-            modeC: 0,
-            line: t.line,
-          });
+          emit({ op: OP.GETGLOBAL, A: kIdx, modeA: MODE.CONST, B: dest, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
           reg = dest;
         }
-        if (peek().type === 'SYM' && peek().val === '(') {
-          const callBase = allocReg();
-          emit({
-            op: OP.MOVE,
-            A: callBase,
-            modeA: MODE.REG,
-            B: 0,
-            modeB: 0,
-            C: reg,
-            modeC: MODE.REG,
-            line: t.line,
-          });
-          next();
-          let argCount = 0;
-          if (!(peek().type === 'SYM' && peek().val === ')')) {
-            while (true) {
-              const argReg = allocReg();
-              compileExpr(argReg);
-              argCount++;
-              if (peek().type === 'SYM' && peek().val === ',') next();
-              else break;
-            }
-          }
-          expect(')');
-          emit({
-            op: OP.CALL,
-            A: 2,
-            modeA: MODE.REG,
-            B: callBase,
-            modeB: MODE.REG,
-            C: argCount + 1,
-            modeC: MODE.REG,
-            line: t.line,
-          });
-          if (targetReg !== undefined && targetReg !== callBase) {
-            emit({
-              op: OP.MOVE,
-              A: targetReg,
-              modeA: MODE.REG,
-              B: 0,
-              modeB: 0,
-              C: callBase,
-              modeC: MODE.REG,
-              line: t.line,
-            });
-            return targetReg;
-          }
-          return callBase;
-        }
-        return reg;
+        return compilePostfix(reg, targetReg, t.line);
       }
       throw new SyntaxError(`Line ${t.line}: unexpected token '${t.val}'`);
     }
 
-    function compileSingleStmt() {
-      const t = peek();
-      if (t.type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
-        next();
-        expect('=');
-        const name = String(t.val);
-        if (locals.has(name)) {
-          compileExpr(locals.get(name));
-        } else {
-          const r = compileExpr();
-          const kIdx = addConst(name);
-          emit({
-            op: OP.SETGLOBAL,
-            A: r,
-            modeA: MODE.REG,
-            B: 0,
-            modeB: 0,
-            C: kIdx,
-            modeC: MODE.CONST,
-            line: t.line,
-          });
-        }
-      } else {
-        compileExpr();
+    function compileStatementsUntil(stopSet: Set<string>) {
+      while (peek().type !== 'EOF') {
+        if (peek().type === 'KW' && stopSet.has(String(peek().val))) break;
+        compileStatement();
       }
     }
 
-    while (peek().type !== 'EOF') {
-      if (stopAtEnd && peek().type === 'KW' && peek().val === 'end') {
-        next();
-        break;
-      }
+    function compileStatement() {
       const t = peek();
       if (t.type === 'KW' && t.val === 'local') {
         next();
@@ -780,23 +875,65 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
           const subProtoIdx = compileBlock(fnParams, true);
           const fnReg = allocReg();
           locals.set(String(nameTok.val), fnReg);
-          emit({
-            op: OP.CLOSURE,
-            A: fnReg,
-            modeA: MODE.REG,
-            B: subProtoIdx,
-            modeB: MODE.PROTO,
-            C: 0,
-            modeC: 0,
-            line: nameTok.line,
-          });
+          emit({ op: OP.CLOSURE, A: fnReg, modeA: MODE.REG, B: subProtoIdx, modeB: MODE.PROTO, C: 0, modeC: 0, line: nameTok.line });
         } else {
           const nameTok = next();
-          expect('=');
           const varReg = allocReg();
-          compileExpr(varReg);
+          if (peek().type === 'SYM' && peek().val === '=') {
+            next();
+            compileExpr(varReg);
+          } else {
+            emit({ op: OP.LOADNIL, A: varReg, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: 0, line: nameTok.line });
+          }
           locals.set(String(nameTok.val), varReg);
         }
+      } else if (t.type === 'KW' && t.val === 'if') {
+        next();
+        const exitJumps: number[] = [];
+        const condReg = compileExpr(allocReg());
+        expect('then');
+        let jFalse = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: t.line });
+        compileStatementsUntil(new Set(['elseif', 'else', 'end']));
+
+        while (peek().type === 'KW' && peek().val === 'elseif') {
+          const eiTok = next();
+          exitJumps.push(emit({ op: OP.JMP, A: 0, modeA: 0, B: 0, modeB: MODE.REG, C: 0, modeC: 0, line: eiTok.line }));
+          insts[jFalse - 1].C = insts.length;
+          const eiCond = compileExpr(allocReg());
+          expect('then');
+          jFalse = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: eiCond, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: eiTok.line });
+          compileStatementsUntil(new Set(['elseif', 'else', 'end']));
+        }
+
+        if (peek().type === 'KW' && peek().val === 'else') {
+          const elTok = next();
+          exitJumps.push(emit({ op: OP.JMP, A: 0, modeA: 0, B: 0, modeB: MODE.REG, C: 0, modeC: 0, line: elTok.line }));
+          insts[jFalse - 1].C = insts.length;
+          compileStatementsUntil(new Set(['end']));
+        } else {
+          insts[jFalse - 1].C = insts.length;
+        }
+        expect('end');
+        for (const jp of exitJumps) {
+          insts[jp - 1].B = insts.length;
+        }
+      } else if (t.type === 'KW' && t.val === 'while') {
+        next();
+        const loopStart = insts.length;
+        const condReg = compileExpr(allocReg());
+        expect('do');
+        const jExit = emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: 0, modeC: MODE.REG, line: t.line });
+        compileStatementsUntil(new Set(['end']));
+        expect('end');
+        emit({ op: OP.JMP, A: 0, modeA: 0, B: loopStart, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        insts[jExit - 1].C = insts.length;
+      } else if (t.type === 'KW' && t.val === 'repeat') {
+        next();
+        const loopStart = insts.length;
+        compileStatementsUntil(new Set(['until']));
+        const uTok = expect('until');
+        const condReg = compileExpr(allocReg());
+        emit({ op: OP.TEST_FALSE, A: 0, modeA: 0, B: condReg, modeB: MODE.REG, C: loopStart, modeC: MODE.REG, line: uTok.line });
       } else if (t.type === 'KW' && t.val === 'for') {
         next();
         const varTok = next();
@@ -813,80 +950,100 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
           compileExpr(stepReg);
         } else {
           const kOne = addConst(1);
-          emit({
-            op: OP.LOADK,
-            A: stepReg,
-            modeA: MODE.REG,
-            B: 0,
-            modeB: 0,
-            C: kOne,
-            modeC: MODE.CONST,
-            line: varTok.line,
-          });
+          emit({ op: OP.LOADK, A: stepReg, modeA: MODE.REG, B: 0, modeB: 0, C: kOne, modeC: MODE.CONST, line: varTok.line });
         }
         expect('do');
-        const prepPc = emit({
-          op: OP.FORPREP,
-          A: base,
-          modeA: MODE.REG,
-          B: 0,
-          modeB: 0,
-          C: 0,
-          modeC: MODE.REG,
-          line: varTok.line,
-        });
+        const prepPc = emit({ op: OP.FORPREP, A: base, modeA: MODE.REG, B: 0, modeB: 0, C: 0, modeC: MODE.REG, line: varTok.line });
         const bodyStartPc = insts.length;
         const loopName = String(varTok.val);
         const prevLocal = locals.get(loopName);
         locals.set(loopName, loopVarReg);
-        while (!(peek().type === 'KW' && peek().val === 'end')) {
-          compileSingleStmt();
-        }
+        compileStatementsUntil(new Set(['end']));
         expect('end');
         if (prevLocal === undefined) locals.delete(loopName);
         else locals.set(loopName, prevLocal);
-        const loopPc = emit({
-          op: OP.FORLOOP,
-          A: 0,
-          modeA: 0,
-          B: base,
-          modeB: MODE.REG,
-          C: bodyStartPc,
-          modeC: MODE.REG,
-          line: varTok.line,
-        });
+        const loopPc = emit({ op: OP.FORLOOP, A: 0, modeA: 0, B: base, modeB: MODE.REG, C: bodyStartPc, modeC: MODE.REG, line: varTok.line });
         insts[prepPc - 1].C = loopPc - 1;
-        emit({
-          op: OP.LOOP_POP,
-          A: 0,
-          modeA: 0,
-          B: 0,
-          modeB: 0,
-          C: 0,
-          modeC: 0,
-          line: varTok.line,
-        });
+        emit({ op: OP.LOOP_POP, A: 0, modeA: 0, B: 0, modeB: 0, C: 0, modeC: 0, line: varTok.line });
       } else if (t.type === 'KW' && t.val === 'return') {
         next();
-        if (peek().type === 'EOF' || (peek().type === 'KW' && peek().val === 'end')) {
+        if (
+          peek().type === 'EOF' ||
+          (peek().type === 'KW' && ['end', 'else', 'elseif', 'until'].includes(String(peek().val)))
+        ) {
           emit({ op: OP.RETURN0, A: 0, modeA: 0, B: 0, modeB: 0, C: 0, modeC: 0, line: t.line });
         } else {
           const r = compileExpr();
-          emit({
-            op: OP.RETURN1,
-            A: 0,
-            modeA: 0,
-            B: r,
-            modeB: MODE.REG,
-            C: 0,
-            modeC: 0,
-            line: t.line,
-          });
+          emit({ op: OP.RETURN1, A: 0, modeA: 0, B: r, modeB: MODE.REG, C: 0, modeC: 0, line: t.line });
+        }
+      } else if (t.type === 'ID' && peek(1).type === 'SYM' && peek(1).val === '=') {
+        next();
+        expect('=');
+        const name = String(t.val);
+        if (locals.has(name)) {
+          compileExpr(locals.get(name));
+        } else {
+          const r = compileExpr();
+          const kIdx = addConst(name);
+          emit({ op: OP.SETGLOBAL, A: r, modeA: MODE.REG, B: 0, modeB: 0, C: kIdx, modeC: MODE.CONST, line: t.line });
+        }
+      } else if (t.type === 'ID' && peek(1).type === 'SYM' && (peek(1).val === '.' || peek(1).val === '[')) {
+        const savedPos = tPos;
+        const baseTok = next();
+        const baseName = String(baseTok.val);
+        let curReg: number;
+        if (locals.has(baseName)) {
+          curReg = locals.get(baseName)!;
+        } else {
+          curReg = allocReg();
+          const kIdx = addConst(baseName);
+          emit({ op: OP.GETGLOBAL, A: kIdx, modeA: MODE.CONST, B: curReg, modeB: MODE.REG, C: 0, modeC: 0, line: baseTok.line });
+        }
+        let lastAccess:
+          | { kind: 'dot'; kIdx: number; line: number }
+          | { kind: 'bracket'; keyReg: number; line: number }
+          | null = null;
+
+        while (peek().type === 'SYM' && (peek().val === '.' || peek().val === '[')) {
+          if (lastAccess) {
+            const nextR = allocReg();
+            if (lastAccess.kind === 'dot') {
+              emit({ op: OP.GETTABLE_K, A: nextR, modeA: MODE.REG, B: lastAccess.kIdx, modeB: MODE.CONST, C: curReg, modeC: MODE.REG, line: baseTok.line });
+            } else {
+              emit({ op: OP.GETTABLE, A: nextR, modeA: MODE.REG, B: curReg, modeB: MODE.REG, C: lastAccess.keyReg, modeC: MODE.REG, line: baseTok.line });
+            }
+            curReg = nextR;
+          }
+          if (peek().val === '.') {
+            next();
+            const fTok = next();
+            lastAccess = { kind: 'dot', kIdx: addConst(String(fTok.val)), line: fTok.line };
+          } else {
+            const lb = next();
+            const keyReg = compileExpr(allocReg());
+            expect(']');
+            lastAccess = { kind: 'bracket', keyReg, line: lb.line };
+          }
+        }
+        if (lastAccess && peek().type === 'SYM' && peek().val === '=') {
+          next();
+          const valReg = compileExpr(allocReg());
+          if (lastAccess.kind === 'dot') {
+            emit({ op: OP.SETTABLE_KR, A: curReg, modeA: MODE.REG, B: lastAccess.kIdx, modeB: MODE.CONST, C: valReg, modeC: MODE.REG, line: lastAccess.line });
+          } else {
+            emit({ op: OP.SETTABLE, A: lastAccess.keyReg, modeA: MODE.REG, B: valReg, modeB: MODE.REG, C: curReg, modeC: MODE.REG, line: lastAccess.line });
+          }
+        } else {
+          tPos = savedPos;
+          compileExpr();
         }
       } else {
-        compileSingleStmt();
+        compileExpr();
       }
     }
+
+    compileStatementsUntil(stopAtEnd ? new Set(['end']) : new Set());
+    if (stopAtEnd) expect('end');
 
     if (
       insts.length === 0 ||
@@ -903,11 +1060,32 @@ export function compileLuaToChunk(luaSource: string): VMChunk {
   return { consts, protos, entryIdx };
 }
 
+function luaTruthy(v: unknown): boolean {
+  return v !== false && v !== undefined && v !== null;
+}
+
+function luaLength(v: unknown): number {
+  if (typeof v === 'string') return v.length;
+  if (v && typeof v === 'object') {
+    const obj = v as Record<string | number, unknown>;
+    let n = 0;
+    while (Object.prototype.hasOwnProperty.call(obj, n + 1) && obj[n + 1] !== undefined) {
+      n++;
+    }
+    return n;
+  }
+  return 0;
+}
+
+function luaMod(a: number, b: number): number {
+  return a - Math.floor(a / b) * b;
+}
+
 export function executeChunk(chunk: VMChunk): ExecutionResult {
   const logs: string[] = [];
   const env: Record<string, unknown> = {
     print: (...args: unknown[]) => {
-      logs.push(args.map((v) => String(v)).join('\t'));
+      logs.push(args.map((v) => (v === undefined ? 'nil' : String(v))).join('\t'));
     },
   };
 
@@ -922,8 +1100,8 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
       let safetySteps = 0;
 
       while (pc <= proto.insts.length) {
-        if (++safetySteps > 50000) {
-          throw new Error('VM execution step limit exceeded (50,000 instructions)');
+        if (++safetySteps > 100000) {
+          throw new Error('VM execution step limit exceeded (100,000 instructions)');
         }
         const inst = proto.insts[pc - 1];
         switch (inst.op) {
@@ -935,8 +1113,14 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
           case OP.JMP:
             pc = inst.B;
             break;
+          case OP.NEWTABLE:
+            reg[inst.B] = {};
+            break;
           case OP.GETGLOBAL:
             reg[inst.B] = env[String(inst.Ak)];
+            break;
+          case OP.LEN:
+            reg[inst.B] = luaLength(reg[inst.C]);
             break;
           case OP.SUB:
             reg[inst.C] = Number(reg[inst.B]) - Number(reg[inst.A]);
@@ -954,6 +1138,11 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
             if (inst.A >= 2) reg[base] = ret;
             break;
           }
+          case OP.GETTABLE: {
+            const tbl = reg[inst.B] as Record<string | number, unknown>;
+            reg[inst.A] = tbl[reg[inst.C] as string | number];
+            break;
+          }
           case OP.FORPREP: {
             loopStack.push({ loopIter, loopLimit, loopStep });
             loopStep = Number(reg[inst.A + 2]);
@@ -962,11 +1151,19 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
             pc = inst.C;
             break;
           }
+          case OP.GETTABLE_K: {
+            const tbl = reg[inst.C] as Record<string | number, unknown>;
+            reg[inst.A] = tbl[inst.Bk as string | number];
+            break;
+          }
           case OP.LOADK:
             reg[inst.A] = inst.Ck;
             break;
           case OP.CONCAT:
             reg[inst.C] = String(reg[inst.B]) + String(reg[inst.A]);
+            break;
+          case OP.MOD:
+            reg[inst.A] = luaMod(Number(reg[inst.B]), Number(reg[inst.C]));
             break;
           case OP.FORLOOP: {
             loopIter += loopStep;
@@ -980,8 +1177,20 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
           case OP.MOVE:
             reg[inst.A] = reg[inst.C];
             break;
+          case OP.TEST_FALSE:
+            if (!luaTruthy(reg[inst.B])) pc = inst.C;
+            break;
           case OP.RETURN0:
             return undefined;
+          case OP.LT:
+            reg[inst.A] = (reg[inst.B] as number) < (reg[inst.C] as number);
+            break;
+          case OP.POW:
+            reg[inst.A] = Math.pow(Number(reg[inst.C]), Number(reg[inst.B]));
+            break;
+          case OP.NOT:
+            reg[inst.A] = !luaTruthy(reg[inst.B]);
+            break;
           case OP.SETGLOBAL:
             env[String(inst.Ck)] = reg[inst.A];
             break;
@@ -990,8 +1199,25 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
             break;
           case OP.RETURN1:
             return reg[inst.B];
+          case OP.UNM:
+            reg[inst.B] = -Number(reg[inst.A]);
+            break;
+          case OP.DIV:
+            reg[inst.A] = Number(reg[inst.C]) / Number(reg[inst.B]);
+            break;
+          case OP.LOADNIL:
+            reg[inst.A] = undefined;
+            break;
+          case OP.SETTABLE_KR: {
+            const tbl = reg[inst.A] as Record<string | number, unknown>;
+            tbl[inst.Bk as string | number] = reg[inst.C];
+            break;
+          }
           case OP.LOADARGS:
             for (let i = 1; i <= inst.B; i++) reg[i] = args[i - 1];
+            break;
+          case OP.LE:
+            reg[inst.A] = (reg[inst.B] as number) <= (reg[inst.C] as number);
             break;
           case OP.EQ:
             reg[inst.C] = reg[inst.B] === reg[inst.A];
@@ -999,6 +1225,11 @@ export function executeChunk(chunk: VMChunk): ExecutionResult {
           case OP.CLOSURE:
             reg[inst.A] = wrapProto(inst.Bk as VMProto);
             break;
+          case OP.SETTABLE: {
+            const tbl = reg[inst.C] as Record<string | number, unknown>;
+            tbl[reg[inst.A] as string | number] = reg[inst.B];
+            break;
+          }
           case OP.LOOP_POP: {
             const prev = loopStack.pop();
             if (prev) ({ loopIter, loopLimit, loopStep } = prev);
@@ -1195,13 +1426,13 @@ function buildCFFBlock(
   return `p=${obfNum(states[0])};while true do ${body}end;`;
 }
 
-function buildOpcodeHandlers(obfNum: (n: number) => string): Record<number, string> {
+function buildFull104OpcodeHandlers(obfNum: (n: number) => string): Record<number, string> {
   const N0 = obfNum(0);
   const N1 = obfNum(1);
   const N2 = obfNum(2);
   const N3 = obfNum(3);
 
-  return {
+  const core: Record<number, string> = {
     0: '',
     2: `(GO)[h[EO]]=(GO[l[EO]]+GO[PO[EO]]);`,
     4: `(GO)[PO[EO]]=(N);`,
@@ -1238,6 +1469,7 @@ function buildOpcodeHandlers(obfNum: (n: number) => string): Record<number, stri
     51: `if not GO[l[EO]]then EO=(h[EO]);end;`,
     52: `(GO)[l[EO]]=(sO[PO[EO]]);`,
     57: `return;`,
+    58: `(GO)[PO[EO]]=(GO[l[EO]]<GO[h[EO]]);`,
     59: `(GO)[PO[EO]]=(GO[h[EO]]^GO[l[EO]]);`,
     60: `(GO)[PO[EO]]=(GO[l[EO]]-t[EO]);`,
     61: `(GO)[PO[EO]]=(not GO[l[EO]]);`,
@@ -1270,6 +1502,12 @@ function buildOpcodeHandlers(obfNum: (n: number) => string): Record<number, stri
     101: `(GO)[PO[EO]]=(PO);`,
     102: `(GO)[l[EO]]=(GO[PO[EO]]*GO[h[EO]]);`,
   };
+
+  const full: Record<number, string> = {};
+  for (let op = 0; op < 104; op++) {
+    full[op] = core[op] !== undefined ? core[op] : '';
+  }
+  return full;
 }
 
 function buildBinarySearchDispatch(
@@ -1279,32 +1517,22 @@ function buildBinarySearchDispatch(
   obfNum: (n: number) => string
 ): string {
   if (sortedOps.length === 0) return '';
-  if (sortedOps.length === 1) {
-    return handlers[sortedOps[0]] || '';
-  }
+  if (sortedOps.length === 1) return handlers[sortedOps[0]] || '';
   if (sortedOps.length === 2) {
     const [opA, opB] = sortedOps;
     const hA = handlers[opA] || '';
     const hB = handlers[opB] || '';
-    if (rng() < 0.5) {
-      return `if a==${obfNum(opA)} then ${hA}else ${hB}end;`;
-    }
+    if (rng() < 0.5) return `if a==${obfNum(opA)} then ${hA}else ${hB}end;`;
     return `if a~=${obfNum(opB)} then ${hA}else ${hB}end;`;
   }
   const midIdx = Math.floor(sortedOps.length / 2);
   const pivot = sortedOps[midIdx];
-  const leftOps = sortedOps.slice(0, midIdx);
-  const rightOps = sortedOps.slice(midIdx);
-  const leftCode = buildBinarySearchDispatch(leftOps, handlers, rng, obfNum);
-  const rightCode = buildBinarySearchDispatch(rightOps, handlers, rng, obfNum);
+  const leftCode = buildBinarySearchDispatch(sortedOps.slice(0, midIdx), handlers, rng, obfNum);
+  const rightCode = buildBinarySearchDispatch(sortedOps.slice(midIdx), handlers, rng, obfNum);
 
   const style = rng();
-  if (style < 0.34) {
-    return `if a<${obfNum(pivot)} then ${leftCode}else ${rightCode}end;`;
-  }
-  if (style < 0.67) {
-    return `if not(a>=${obfNum(pivot)})then ${leftCode}else ${rightCode}end;`;
-  }
+  if (style < 0.34) return `if a<${obfNum(pivot)} then ${leftCode}else ${rightCode}end;`;
+  if (style < 0.67) return `if not(a>=${obfNum(pivot)})then ${leftCode}else ${rightCode}end;`;
   return `if a<=${obfNum(pivot - 1)} then ${leftCode}else ${rightCode}end;`;
 }
 
@@ -1399,32 +1627,47 @@ return (function(PAYLOAD, XOR_KEY, CONST_BIAS, PROTO_BIAS, INST_BIAS)
         local op = pr.O[pc]
         if op == 2 then R[pr.C[pc]] = R[pr.B[pc]] + R[pr.A[pc]]
         elseif op == 5 then pc = pr.B[pc]
+        elseif op == 11 then R[pr.B[pc]] = {}
         elseif op == 12 then R[pr.B[pc]] = env[pr.Ak[pc]]
+        elseif op == 14 then R[pr.B[pc]] = #R[pr.C[pc]]
         elseif op == 17 then R[pr.C[pc]] = R[pr.B[pc]] - R[pr.A[pc]]
         elseif op == 20 then
           local base, nA = pr.B[pc], pr.C[pc] - 1
           local ca = {}; for i = 1, nA do ca[i] = R[base + i] end
           local res = R[base]((table.unpack or unpack)(ca, 1, nA))
           if pr.A[pc] >= 2 then R[base] = res end
+        elseif op == 23 then R[pr.A[pc]] = R[pr.B[pc]][R[pr.C[pc]]]
         elseif op == 25 then
           st[#st+1] = {lIt, lLim, lStep}
           lStep, lLim = R[pr.A[pc]+2], R[pr.A[pc]+1]
           lIt = R[pr.A[pc]] - lStep; pc = pr.C[pc]
+        elseif op == 32 then R[pr.A[pc]] = R[pr.C[pc]][pr.Bk[pc]]
         elseif op == 34 then R[pr.A[pc]] = pr.Ck[pc]
         elseif op == 42 then R[pr.C[pc]] = tostring(R[pr.B[pc]]) .. tostring(R[pr.A[pc]])
+        elseif op == 44 then R[pr.A[pc]] = R[pr.B[pc]] % R[pr.C[pc]]
         elseif op == 46 then
           lIt = lIt + lStep
           if (lStep <= 0 and lIt >= lLim) or (lStep > 0 and lIt <= lLim) then
             R[pr.B[pc]+3] = lIt; pc = pr.C[pc]
           end
         elseif op == 47 then R[pr.A[pc]] = R[pr.C[pc]]
+        elseif op == 51 then if not R[pr.B[pc]] then pc = pr.C[pc] end
         elseif op == 57 then return
+        elseif op == 58 then R[pr.A[pc]] = (R[pr.B[pc]] < R[pr.C[pc]])
+        elseif op == 59 then R[pr.A[pc]] = R[pr.C[pc]] ^ R[pr.B[pc]]
+        elseif op == 61 then R[pr.A[pc]] = not R[pr.B[pc]]
         elseif op == 64 then env[pr.Ck[pc]] = R[pr.A[pc]]
         elseif op == 68 then R[pr.A[pc]] = R[pr.B[pc]] + pr.Ck[pc]
         elseif op == 69 then return R[pr.B[pc]]
+        elseif op == 75 then R[pr.B[pc]] = -R[pr.A[pc]]
+        elseif op == 81 then R[pr.A[pc]] = R[pr.C[pc]] / R[pr.B[pc]]
+        elseif op == 82 then R[pr.A[pc]] = nil
+        elseif op == 85 then R[pr.A[pc]][pr.Bk[pc]] = R[pr.C[pc]]
         elseif op == 86 then for i = 1, pr.B[pc] do R[i] = args[i] end
+        elseif op == 87 then R[pr.A[pc]] = (R[pr.B[pc]] <= R[pr.C[pc]])
         elseif op == 88 then R[pr.C[pc]] = (R[pr.B[pc]] == R[pr.A[pc]])
         elseif op == 90 then R[pr.A[pc]] = wrap(pr.Bk[pc])
+        elseif op == 94 then R[pr.C[pc]][R[pr.A[pc]]] = R[pr.B[pc]]
         elseif op == 99 then local s = table.remove(st); lIt, lLim, lStep = s[1], s[2], s[3]
         elseif op == 102 then R[pr.B[pc]] = R[pr.A[pc]] * R[pr.C[pc]]
         end
@@ -1435,7 +1678,7 @@ return (function(PAYLOAD, XOR_KEY, CONST_BIAS, PROTO_BIAS, INST_BIAS)
   return wrap(entry)(...)
 end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CONSTANTS.PROTO_COUNT_BIAS}, ${FORMAT_CONSTANTS.INST_COUNT_BIAS})
 `;
-    return { code, cffChecks: [], opcodeCount: 20, keyTableL: [] };
+    return { code, cffChecks: [], opcodeCount: Object.keys(OP).length, keyTableL: [] };
   }
 
   const rng = createRng(seed);
@@ -1445,10 +1688,8 @@ end)("${escaped}", ${xorKey}, ${FORMAT_CONSTANTS.CONST_COUNT_BIAS}, ${FORMAT_CON
   const cffChecks: CffTransitionCheck[] = [];
 
   const L = Array.from({ length: 9 }, () => Math.floor(rng() * 0x7fffffff) + 1024);
-  const handlers = buildOpcodeHandlers(obfNum);
-  const sortedOps = Object.keys(handlers)
-    .map(Number)
-    .sort((a, b) => a - b);
+  const handlers = buildFull104OpcodeHandlers(obfNum);
+  const sortedOps = Array.from({ length: 104 }, (_, i) => i);
   const dispatchTree = buildBinarySearchDispatch(sortedOps, handlers, rng, obfNum);
 
   const cffBootstrap = buildCFFBlock(
@@ -1610,6 +1851,7 @@ export const ANALYZED_OPCODES: OpcodeSpec[] = [
   { code: 51, mnemonic: 'TEST_FALSE', category: 'Control Flow', semantics: 'if not R[B] then pc = C end' },
   { code: 52, mnemonic: 'GETUPVAL_RAW', category: 'Tables & Upvalues', semantics: 'R[B] = upvals[A]' },
   { code: 57, mnemonic: 'RETURN0', category: 'Calls & Returns', semantics: 'return (0 values)' },
+  { code: 58, mnemonic: 'LT', category: 'Control Flow', semantics: 'R[A] = (R[B] < R[C])' },
   { code: 59, mnemonic: 'POW', category: 'Arithmetic & String', semantics: 'R[A] = R[C] ^ R[B]' },
   { code: 60, mnemonic: 'SUBK', category: 'Arithmetic & String', semantics: 'R[A] = R[B] - C_const' },
   { code: 61, mnemonic: 'NOT', category: 'Arithmetic & String', semantics: 'R[A] = not R[B]' },
@@ -1629,6 +1871,7 @@ export const ANALYZED_OPCODES: OpcodeSpec[] = [
   { code: 83, mnemonic: 'CONCAT_RK', category: 'Arithmetic & String', semantics: 'R[A] = R[B] .. C_const' },
   { code: 85, mnemonic: 'SETTABLE_KR', category: 'Tables & Upvalues', semantics: 'R[A][B_const] = R[C]' },
   { code: 86, mnemonic: 'LOADARGS', category: 'Calls & Returns', semantics: 'for i = 1, B do R[i] = args[i] end' },
+  { code: 87, mnemonic: 'LE', category: 'Control Flow', semantics: 'R[A] = (R[B] <= R[C])' },
   { code: 88, mnemonic: 'EQ', category: 'Control Flow', semantics: 'R[C] = (R[B] == R[A])' },
   { code: 89, mnemonic: 'SELFMOD_35', category: 'VM Introspection', semantics: 'Rewrites opcode[pc] = 35 (NEK_JMP) after check', note: 'Self-modifying -> OP 35' },
   { code: 90, mnemonic: 'CLOSURE', category: 'Calls & Returns', semantics: 'R[A] = createVMClosure(B_const, upvals)' },
