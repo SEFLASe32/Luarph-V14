@@ -1,0 +1,6 @@
+{
+  "name": "Lua VM Static Analyzer & Reverse Encoder",
+  "description": "Static structural analysis of Luraph v14.3 VM bytecode architecture, readable decoded.lua reconstruction, and interactive reverse-encoding round-trip verifier.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
